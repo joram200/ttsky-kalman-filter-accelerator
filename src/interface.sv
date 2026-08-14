@@ -1,265 +1,296 @@
 `timescale 1ns/1ps
 // =============================================================================
-// interface.sv — M4: Option B Kalman Update Accelerator — AXI4-Lite Interface
-// Extracted from post_m3_Minor_Redesign/rtl/top.sv
-// Contains: axilite_slave
-// Register map:
-//   0x00 CTRL   R/W  [0]=start, [1]=sw_rst
-//   0x08 STAT   RO   [0]=done,  [1]=busy
-//   0x10 z      WO   A_REG[0]
-//   0x18 x_in0  WO   A_REG[1]
-//   0x20 x_in1  WO   A_REG[2]
-//   0x28 x_in2  WO   A_REG[3]
-//   0x30 x_out0 RO   A_REG[4]  (core_x_out[0])
-//   0x38 x_out1 RO   A_REG[5]  (core_x_out[1])
-//   0x40 x_out2 RO   A_REG[6]  (core_x_out[2])
-//   0x58–0x98  P_in[0:8]  WO   B_REG[0:8]
-//   0xA0–0xE0  P_out[0:8] RO   C_REG[0:8]  (core_C[0:8])
-//   0xE8 R_REG  R/W  programmable measurement noise (default 5.0)
+// interface.sv — SPI slave register file for tt_um_joram200
+//
+// Protocol: CPOL=0, CPHA=0, MSB-first, 8-bit frames.
+// Transaction format: 1 command byte then N×8 data bytes while CS_N is low.
+// Command byte: bit[7]=R/W (1=write, 0=read), bits[6:0]=start register address.
+// Each F64 register = 8 data bytes. Address auto-increments by 1 per completed
+// 64-bit word within a CS_N-low burst.
+//
+// Register map (28 registers, indices 0–27):
+//   0   CTRL      W      [0]=start one-shot pulse, [1]=sw_rst (level)
+//   1   STAT      R      [0]=done_latch (clears on STAT read), [1]=busy
+//   2   z         W      scalar measurement F64
+//   3   x_in[0]   W      prior state element 0 F64
+//   4   x_in[1]   W      prior state element 1 F64
+//   5   x_in[2]   W      prior state element 2 F64
+//   6   x_out[0]  R      corrected state element 0 F64
+//   7   x_out[1]  R      corrected state element 1 F64
+//   8   x_out[2]  R      corrected state element 2 F64
+//   9   P_in[0]   W      prior covariance [0,0] F64
+//  10   P_in[1]   W      [0,1]
+//  11   P_in[2]   W      [0,2]
+//  12   P_in[3]   W      [1,0]
+//  13   P_in[4]   W      [1,1]
+//  14   P_in[5]   W      [1,2]
+//  15   P_in[6]   W      [2,0]
+//  16   P_in[7]   W      [2,1]
+//  17   P_in[8]   W      [2,2]
+//  18   P_out[0]  R      updated covariance [0,0] F64
+//  19   P_out[1]  R      [0,1]
+//  20   P_out[2]  R      [0,2]
+//  21   P_out[3]  R      [1,0]
+//  22   P_out[4]  R      [1,1]
+//  23   P_out[5]  R      [1,2]
+//  24   P_out[6]  R      [2,0]
+//  25   P_out[7]  R      [2,1]
+//  26   P_out[8]  R      [2,2]
+//  27   R_REG     R/W    measurement noise R; reset default = 5.0 F64
 // =============================================================================
-
-// -----------------------------------------------------------------------------
-// axilite_slave — AXI4-Lite register file + core handshake
-// -----------------------------------------------------------------------------
-module axilite_slave #(
-    parameter int ADDR_WIDTH = 32,
-    parameter int DATA_WIDTH = 64
-)(
-    input  logic                      clk,
-    input  logic                      rst_n,
-    // AXI4-Lite write address channel
-    input  logic [ADDR_WIDTH-1:0]     s_awaddr,
-    input  logic                      s_awvalid,
-    output logic                      s_awready,
-    // AXI4-Lite write data channel
-    input  logic [DATA_WIDTH-1:0]     s_wdata,
-    input  logic [(DATA_WIDTH/8)-1:0] s_wstrb,
-    input  logic                      s_wvalid,
-    output logic                      s_wready,
-    // AXI4-Lite write response channel
-    output logic [1:0]                s_bresp,
-    output logic                      s_bvalid,
-    input  logic                      s_bready,
-    // AXI4-Lite read address channel
-    input  logic [ADDR_WIDTH-1:0]     s_araddr,
-    input  logic                      s_arvalid,
-    output logic                      s_arready,
-    // AXI4-Lite read data channel
-    output logic [DATA_WIDTH-1:0]     s_rdata,
-    output logic [1:0]                s_rresp,
-    output logic                      s_rvalid,
-    input  logic                      s_rready,
-    // Core control outputs
-    output logic                      core_start,
-    output logic                      core_rst_n,
-    output logic [63:0]               core_A [0:8],
-    output logic [63:0]               core_B [0:8],
-    output logic [63:0]               core_R,           // R_REG → kalman_update.r_val
-    // Core status inputs
-    input  logic [63:0]               core_C [0:8],     // P_out[0:8]
-    input  logic [63:0]               core_x_out [0:2], // x_out[0:2] → A_REG[4:6] reads
-    input  logic                      core_done,
-    input  logic                      core_busy
+module spi_slave (
+    input  logic        clk,
+    input  logic        rst_n,
+    // SPI pins (CPOL=0, CPHA=0)
+    input  logic        sclk,
+    input  logic        mosi,
+    input  logic        cs_n,
+    output logic        miso,
+    // Core control
+    output logic        core_start,   // 1-cycle pulse when CTRL[0] written as 1
+    output logic        sw_rst,       // level: mirrors CTRL[1]
+    // Kalman inputs (written by host)
+    output logic [63:0] z_reg,
+    output logic [63:0] x_in_reg [0:2],
+    output logic [63:0] P_in_reg [0:8],
+    output logic [63:0] r_val,        // R_REG; reset default = 5.0 F64
+    // Kalman status / outputs (read by host)
+    input  logic        done,
+    input  logic        busy,
+    input  logic [63:0] x_out  [0:2],
+    input  logic [63:0] P_out  [0:8]
 );
 
-    logic [63:0] reg_ctrl;
-    logic [63:0] reg_A [0:8];
-    logic [63:0] reg_B [0:8];
-    logic [63:0] reg_R;           // programmable R, default 5.0
+    // -------------------------------------------------------------------------
+    // Two-stage synchroniser for SPI pins → clk domain
+    // -------------------------------------------------------------------------
+    logic sclk_r1, sclk_r2;
+    logic cs_n_r1, cs_n_r2;
+    logic mosi_r;   // one-stage is sufficient after the two-stage
 
-    logic        aw_done;
-    logic        w_done;
-    logic [ADDR_WIDTH-1:0] aw_addr_lat;
-    logic [DATA_WIDTH-1:0] w_data_lat;
-
-    logic start_pending;
-
-    // -----------------------------------------------------------------------
-    // Write address channel
-    // -----------------------------------------------------------------------
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            s_awready   <= 1'b1;
-            aw_done     <= 1'b0;
-            aw_addr_lat <= '0;
+            sclk_r1 <= 1'b0; sclk_r2 <= 1'b0;
+            cs_n_r1 <= 1'b1; cs_n_r2 <= 1'b1;
+            mosi_r  <= 1'b0;
         end else begin
-            if (s_awvalid && s_awready) begin
-                aw_addr_lat <= s_awaddr;
-                aw_done     <= 1'b1;
-                s_awready   <= 1'b0;
-            end else if (aw_done && w_done) begin
-                aw_done   <= 1'b0;
-                s_awready <= 1'b1;
-            end
+            sclk_r1 <= sclk;   sclk_r2 <= sclk_r1;
+            cs_n_r1 <= cs_n;   cs_n_r2 <= cs_n_r1;
+            mosi_r  <= mosi;   // sample MOSI one cycle before SCLK rise is detected
         end
     end
 
-    // -----------------------------------------------------------------------
-    // Write data channel
-    // -----------------------------------------------------------------------
+    // Detected one clk cycle after the actual edge (sclk_r2 = two cycles old)
+    wire sclk_rise = ( sclk_r1 && !sclk_r2);
+    wire sclk_fall = (!sclk_r1 &&  sclk_r2);
+    wire cs_fall   = (!cs_n_r1 &&  cs_n_r2);
+    wire cs_rise   = ( cs_n_r1 && !cs_n_r2);
+    wire cs_active = !cs_n_r1;
+
+    // -------------------------------------------------------------------------
+    // Transaction state machine
+    // -------------------------------------------------------------------------
+    typedef enum logic [1:0] {
+        ST_IDLE = 2'd0,
+        ST_CMD  = 2'd1,
+        ST_DATA = 2'd2
+    } spi_st_t;
+
+    spi_st_t st;
+
+    logic [2:0] bit_cnt;   // bit position within current byte (0=first bit received)
+    logic [2:0] byte_cnt;  // byte index within current 64-bit word (0=first byte)
+    logic       rw;        // 1=write, 0=read (latched from command byte)
+    logic [6:0] cur_addr;  // current register address (auto-increments per word)
+
+    // Incoming shift register: assembled MSB-first over 8 clocks per byte,
+    // then packed 8 bytes left-to-right into rx_word.
+    logic [7:0]  rx_byte;   // shift register for one byte
+    logic [55:0] rx_acc;    // accumulates bytes 0..6; byte 7 is rx_byte
+
+    // MISO shift register
+    logic [63:0] tx_shift;
+
+    // done latch
+    logic done_latch;
+
+    // Default R value
+    localparam logic [63:0] R_DEFAULT = 64'h4014_0000_0000_0000; // 5.0 F64
+
+    // -------------------------------------------------------------------------
+    // Register read function
+    // -------------------------------------------------------------------------
+    function automatic logic [63:0] reg_read_fn (input logic [6:0] addr);
+        case (addr)
+            7'd1:  reg_read_fn = {62'b0, busy, done_latch};
+            7'd6:  reg_read_fn = x_out[0];
+            7'd7:  reg_read_fn = x_out[1];
+            7'd8:  reg_read_fn = x_out[2];
+            7'd18: reg_read_fn = P_out[0];
+            7'd19: reg_read_fn = P_out[1];
+            7'd20: reg_read_fn = P_out[2];
+            7'd21: reg_read_fn = P_out[3];
+            7'd22: reg_read_fn = P_out[4];
+            7'd23: reg_read_fn = P_out[5];
+            7'd24: reg_read_fn = P_out[6];
+            7'd25: reg_read_fn = P_out[7];
+            7'd26: reg_read_fn = P_out[8];
+            7'd27: reg_read_fn = r_val;
+            default: reg_read_fn = 64'h0;
+        endcase
+    endfunction
+
+    // -------------------------------------------------------------------------
+    // Main sequential block
+    // -------------------------------------------------------------------------
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            s_wready   <= 1'b1;
-            w_done     <= 1'b0;
-            w_data_lat <= '0;
+            st         <= ST_IDLE;
+            bit_cnt    <= 3'd0;
+            byte_cnt   <= 3'd0;
+            rw         <= 1'b0;
+            cur_addr   <= 7'd0;
+            rx_byte    <= 8'h0;
+            rx_acc     <= 56'h0;
+            tx_shift   <= 64'h0;
+            miso       <= 1'b0;
+            done_latch <= 1'b0;
+            core_start <= 1'b0;
+            sw_rst     <= 1'b0;
+            z_reg         <= 64'h0;
+            x_in_reg[0]   <= 64'h0;
+            x_in_reg[1]   <= 64'h0;
+            x_in_reg[2]   <= 64'h0;
+            P_in_reg[0]   <= 64'h0;
+            P_in_reg[1]   <= 64'h0;
+            P_in_reg[2]   <= 64'h0;
+            P_in_reg[3]   <= 64'h0;
+            P_in_reg[4]   <= 64'h0;
+            P_in_reg[5]   <= 64'h0;
+            P_in_reg[6]   <= 64'h0;
+            P_in_reg[7]   <= 64'h0;
+            P_in_reg[8]   <= 64'h0;
+            r_val         <= R_DEFAULT;
         end else begin
-            if (s_wvalid && s_wready) begin
-                w_data_lat <= s_wdata;
-                w_done     <= 1'b1;
-                s_wready   <= 1'b0;
-            end else if (aw_done && w_done) begin
-                w_done    <= 1'b0;
-                s_wready  <= 1'b1;
+            // One-cycle pulse default
+            core_start <= 1'b0;
+
+            // Capture done pulse from compute core
+            if (done) done_latch <= 1'b1;
+
+            // CS_N falling edge: reset transaction state
+            if (cs_fall) begin
+                st       <= ST_CMD;
+                bit_cnt  <= 3'd0;
+                byte_cnt <= 3'd0;
+                rx_byte  <= 8'h0;
+                rx_acc   <= 56'h0;
             end
-        end
-    end
 
-    // -----------------------------------------------------------------------
-    // Write execute
-    // Index decode: addr[7:3]
-    //   0  = CTRL
-    //   1  = STAT (RO, ignored)
-    //   2–5   = A_REG[0:3]  (z, x_in[0:2])
-    //   6–8   = A_REG[4:6]  (x_out — RO, writes ignored)
-    //   9–10  = A_REG[7:8]  (unused, ignored)
-    //   11–19 = B_REG[0:8]  (P_in)
-    //   20–28 = C_REG[0:8]  (P_out — RO, ignored)
-    //   29    = R_REG
-    // -----------------------------------------------------------------------
-    logic write_commit;
-    assign write_commit = aw_done && w_done;
-
-    logic [4:0] wr_idx;
-    assign wr_idx = aw_addr_lat[7:3];
-
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            reg_ctrl      <= '0;
-            reg_R         <= 64'h4014_0000_0000_0000;  // default R = 5.0
-            start_pending <= 1'b0;
-            for (int i = 0; i < 9; i++) begin
-                reg_A[i] <= '0;
-                reg_B[i] <= '0;
+            // CS_N rising edge: end transaction
+            if (cs_rise) begin
+                st <= ST_IDLE;
             end
-        end else begin
-            start_pending <= 1'b0;
 
-            if (write_commit) begin
-                case (wr_idx)
-                    5'd0: begin
-                        reg_ctrl <= w_data_lat;
-                        if (w_data_lat[0]) start_pending <= 1'b1;
+            // SCLK rising edge: shift in MOSI
+            if (sclk_rise && cs_active) begin
+                case (st)
+
+                    // --------------------------------------------------------
+                    // ST_CMD: receive 8-bit command byte
+                    // --------------------------------------------------------
+                    ST_CMD: begin
+                        rx_byte <= {rx_byte[6:0], mosi_r};
+                        if (bit_cnt == 3'd7) begin
+                            // Full command byte assembled: {rx_byte[6:0], mosi_r}
+                            // bit[7] = MSB = rw (rx_byte[6] after 7 shifts)
+                            // bits[6:0] = addr ({rx_byte[5:0], mosi_r})
+                            rw       <= rx_byte[6];
+                            cur_addr <= {rx_byte[5:0], mosi_r};
+                            st       <= ST_DATA;
+                            bit_cnt  <= 3'd0;
+                            byte_cnt <= 3'd0;
+                            rx_byte  <= 8'h0;
+                            rx_acc   <= 56'h0;
+                            // For reads: pre-load the MISO shift register
+                            if (!rx_byte[6]) begin
+                                tx_shift <= reg_read_fn({rx_byte[5:0], mosi_r});
+                                // Clear done_latch if reading STAT
+                                if ({rx_byte[5:0], mosi_r} == 7'd1) done_latch <= 1'b0;
+                            end
+                        end else begin
+                            bit_cnt <= bit_cnt + 3'd1;
+                        end
                     end
-                    // idx 1 = STAT (RO, ignored)
-                    5'd2:  reg_A[0] <= w_data_lat;   // z
-                    5'd3:  reg_A[1] <= w_data_lat;   // x_in[0]
-                    5'd4:  reg_A[2] <= w_data_lat;   // x_in[1]
-                    5'd5:  reg_A[3] <= w_data_lat;   // x_in[2]
-                    // idx 6–8 = x_out (RO, ignored)
-                    // idx 9–10 = unused (ignored)
-                    5'd11: reg_B[0] <= w_data_lat;
-                    5'd12: reg_B[1] <= w_data_lat;
-                    5'd13: reg_B[2] <= w_data_lat;
-                    5'd14: reg_B[3] <= w_data_lat;
-                    5'd15: reg_B[4] <= w_data_lat;
-                    5'd16: reg_B[5] <= w_data_lat;
-                    5'd17: reg_B[6] <= w_data_lat;
-                    5'd18: reg_B[7] <= w_data_lat;
-                    5'd19: reg_B[8] <= w_data_lat;
-                    // idx 20–28 = P_out (RO, ignored)
-                    5'd29: reg_R <= w_data_lat;       // R_REG
+
+                    // --------------------------------------------------------
+                    // ST_DATA: receive/transmit 64-bit register words
+                    // --------------------------------------------------------
+                    ST_DATA: begin
+                        rx_byte <= {rx_byte[6:0], mosi_r};
+                        if (bit_cnt == 3'd7) begin
+                            bit_cnt <= 3'd0;
+                            if (byte_cnt == 3'd7) begin
+                                // ---- 64-bit word complete ----
+                                byte_cnt <= 3'd0;
+                                rx_acc   <= 56'h0;
+                                rx_byte  <= 8'h0;
+                                if (rw) begin
+                                    // Full word: {rx_acc[55:0], rx_byte[6:0], mosi_r}
+                                    // (rx_acc and rx_byte hold OLD values; NBAs haven't fired)
+                                    case (cur_addr)
+                                        7'd0: begin
+                                            // CTRL: bit[0]=start, bit[1]=sw_rst
+                                            // Last bit received = mosi_r = word bit[0]
+                                            // Second-to-last = rx_byte[0] = word bit[1]
+                                            core_start <= mosi_r;
+                                            sw_rst     <= rx_byte[0];
+                                        end
+                                        7'd2:  z_reg       <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd3:  x_in_reg[0] <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd4:  x_in_reg[1] <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd5:  x_in_reg[2] <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd9:  P_in_reg[0] <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd10: P_in_reg[1] <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd11: P_in_reg[2] <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd12: P_in_reg[3] <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd13: P_in_reg[4] <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd14: P_in_reg[5] <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd15: P_in_reg[6] <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd16: P_in_reg[7] <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd17: P_in_reg[8] <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd27: r_val       <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        default: ;
+                                    endcase
+                                end
+                                // Advance burst address
+                                cur_addr <= cur_addr + 7'd1;
+                                // For read bursts: pre-load next register
+                                if (!rw) begin
+                                    tx_shift <= reg_read_fn(cur_addr + 7'd1);
+                                    if ((cur_addr + 7'd1) == 7'd1) done_latch <= 1'b0;
+                                end
+                            end else begin
+                                // Pack completed byte into rx_acc (bytes 0..6)
+                                rx_acc   <= {rx_acc[47:0], rx_byte[6:0], mosi_r};
+                                byte_cnt <= byte_cnt + 3'd1;
+                                rx_byte  <= 8'h0;
+                            end
+                        end else begin
+                            bit_cnt <= bit_cnt + 3'd1;
+                        end
+                    end
+
                     default: ;
                 endcase
             end
-        end
-    end
 
-    // -----------------------------------------------------------------------
-    // Write response channel
-    // -----------------------------------------------------------------------
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            s_bvalid <= 1'b0;
-            s_bresp  <= 2'b00;
-        end else begin
-            if (write_commit && !s_bvalid) begin
-                s_bvalid <= 1'b1;
-                s_bresp  <= 2'b00;
-            end else if (s_bvalid && s_bready) begin
-                s_bvalid <= 1'b0;
+            // SCLK falling edge: drive MISO from tx_shift (CPHA=0 convention)
+            if (sclk_fall && cs_active) begin
+                miso     <= tx_shift[63];
+                tx_shift <= {tx_shift[62:0], 1'b0};
             end
         end
     end
-
-    // -----------------------------------------------------------------------
-    // Read channel
-    // -----------------------------------------------------------------------
-    logic [4:0] rd_idx;
-    assign rd_idx = s_araddr[7:3];
-
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            s_arready <= 1'b1;
-            s_rvalid  <= 1'b0;
-            s_rdata   <= '0;
-            s_rresp   <= 2'b00;
-        end else begin
-            if (s_arvalid && s_arready) begin
-                s_arready <= 1'b0;
-                s_rvalid  <= 1'b1;
-                s_rresp   <= 2'b00;
-                case (rd_idx)
-                    5'd0:  s_rdata <= reg_ctrl;
-                    5'd1:  s_rdata <= {62'b0, core_busy, core_done};
-                    5'd2:  s_rdata <= reg_A[0];            // z
-                    5'd3:  s_rdata <= reg_A[1];            // x_in[0]
-                    5'd4:  s_rdata <= reg_A[2];            // x_in[1]
-                    5'd5:  s_rdata <= reg_A[3];            // x_in[2]
-                    5'd6:  s_rdata <= core_x_out[0];       // 0x30 — x_out[0]
-                    5'd7:  s_rdata <= core_x_out[1];       // 0x38 — x_out[1]
-                    5'd8:  s_rdata <= core_x_out[2];       // 0x40 — x_out[2]
-                    5'd9:  s_rdata <= reg_A[7];
-                    5'd10: s_rdata <= reg_A[8];
-                    5'd11: s_rdata <= reg_B[0];
-                    5'd12: s_rdata <= reg_B[1];
-                    5'd13: s_rdata <= reg_B[2];
-                    5'd14: s_rdata <= reg_B[3];
-                    5'd15: s_rdata <= reg_B[4];
-                    5'd16: s_rdata <= reg_B[5];
-                    5'd17: s_rdata <= reg_B[6];
-                    5'd18: s_rdata <= reg_B[7];
-                    5'd19: s_rdata <= reg_B[8];
-                    5'd20: s_rdata <= core_C[0];           // 0xA0 — P_out[0,0]
-                    5'd21: s_rdata <= core_C[1];           // 0xA8 — P_out[0,1]
-                    5'd22: s_rdata <= core_C[2];           // 0xB0 — P_out[0,2]
-                    5'd23: s_rdata <= core_C[3];           // 0xB8 — P_out[1,0]
-                    5'd24: s_rdata <= core_C[4];           // 0xC0 — P_out[1,1]
-                    5'd25: s_rdata <= core_C[5];           // 0xC8 — P_out[1,2]
-                    5'd26: s_rdata <= core_C[6];           // 0xD0 — P_out[2,0]
-                    5'd27: s_rdata <= core_C[7];           // 0xD8 — P_out[2,1]
-                    5'd28: s_rdata <= core_C[8];           // 0xE0 — P_out[2,2]
-                    5'd29: s_rdata <= reg_R;               // 0xE8 — R_REG
-                    default: s_rdata <= '0;
-                endcase
-            end else if (s_rvalid && s_rready) begin
-                s_rvalid  <= 1'b0;
-                s_arready <= 1'b1;
-            end
-        end
-    end
-
-    // -----------------------------------------------------------------------
-    // Core control outputs
-    // -----------------------------------------------------------------------
-    assign core_start = start_pending;
-    assign core_rst_n = rst_n & ~reg_ctrl[1];
-    assign core_R     = reg_R;
-
-    generate
-        for (genvar gi = 0; gi < 9; gi++) begin : gen_core_ab
-            assign core_A[gi] = reg_A[gi];
-            assign core_B[gi] = reg_B[gi];
-        end
-    endgenerate
 
 endmodule

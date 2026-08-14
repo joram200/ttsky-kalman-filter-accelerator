@@ -1,94 +1,97 @@
 `timescale 1ns/1ps
 // =============================================================================
-// top.sv — M4: Option B Kalman Update Accelerator — Integration Top
-// Extracted from post_m3_Minor_Redesign/rtl/top.sv
-// Contains: top (integration wrapper only)
-// Instantiates: axilite_slave (interface.sv), kalman_update (compute_core.sv)
+// top.sv — Tiny Tapeout standard top-level wrapper for tt_um_joram200
+//
+// Instantiates:
+//   u_spi  spi_slave     (interface.sv) — SPI register file, 28 registers
+//   u_core kalman_update (compute_core.sv) — scalar Kalman update FSM
+//
+// Pin assignments:
+//   uio_in[0]  → SCLK (SPI clock)
+//   uio_in[1]  → MOSI (SPI data in)
+//   uio_out[2] → MISO (SPI data out)
+//   uio_in[3]  → CS_N (SPI chip select, active low)
+//   uio_oe     = 8'b0000_0100  (only bit 2 is output)
+//   uo_out[0]  = busy
+//   uo_out[1]  = done
+//   uo_out[7:2] = 6'b0
+//   ui_in       unused
 // =============================================================================
-module top #(
-    parameter int ADDR_WIDTH = 32,
-    parameter int DATA_WIDTH = 64
-)(
-    input  logic                      clk,
-    input  logic                      rst_n,
-    input  logic [ADDR_WIDTH-1:0]     s_awaddr,
-    input  logic                      s_awvalid,
-    output logic                      s_awready,
-    input  logic [DATA_WIDTH-1:0]     s_wdata,
-    input  logic [(DATA_WIDTH/8)-1:0] s_wstrb,
-    input  logic                      s_wvalid,
-    output logic                      s_wready,
-    output logic [1:0]                s_bresp,
-    output logic                      s_bvalid,
-    input  logic                      s_bready,
-    input  logic [ADDR_WIDTH-1:0]     s_araddr,
-    input  logic                      s_arvalid,
-    output logic                      s_arready,
-    output logic [DATA_WIDTH-1:0]     s_rdata,
-    output logic [1:0]                s_rresp,
-    output logic                      s_rvalid,
-    input  logic                      s_rready
+module tt_um_joram200 (
+    input  logic [7:0] ui_in,
+    output logic [7:0] uo_out,
+    input  logic [7:0] uio_in,
+    output logic [7:0] uio_out,
+    output logic [7:0] uio_oe,
+    input  logic       ena,
+    input  logic       clk,
+    input  logic       rst_n
 );
 
-    logic        core_start, core_rst_n, core_done, core_busy;
-    logic [63:0] slave_A [0:8];  // A_REG: [0]=z, [1:3]=x_in, [4:6]=unused writes
-    logic [63:0] slave_B [0:8];  // B_REG: [0:8]=P_in
-    logic [63:0] slave_C [0:8];  // C_REG: [0:8]=P_out (all 9)
-    logic [63:0] r_wire;         // R_REG value → kalman_update.r_val
+    // SPI signals
+    logic sclk, mosi, miso, cs_n;
+    assign sclk  = uio_in[0];
+    assign mosi  = uio_in[1];
+    assign cs_n  = uio_in[3];
 
-    // x_in extracted from slave_A[1:3]
-    logic [63:0] x_in_wire [0:2];
-    assign x_in_wire[0] = slave_A[1];
-    assign x_in_wire[1] = slave_A[2];
-    assign x_in_wire[2] = slave_A[3];
+    // uio direction: only bit 2 (MISO) is driven by ASIC
+    assign uio_oe  = 8'b0000_0100;
+    assign uio_out = {5'b0, miso, 2'b0};
 
-    // kalman_update outputs
-    logic [63:0] x_out [0:2];
-    logic [63:0] P_out [0:8];
+    // Core control / status wires
+    logic        core_start, sw_rst_w;
+    logic        core_done,  core_busy;
 
-    // C_REG[0:8] = P_out[0:8] (all 9 covariance output elements)
-    generate
-        for (genvar gi = 0; gi < 9; gi++) begin : gen_slave_c
-            assign slave_C[gi] = P_out[gi];
-        end
-    endgenerate
+    // Register file wires
+    logic [63:0] z_w;
+    logic [63:0] x_in_w  [0:2];
+    logic [63:0] P_in_w  [0:8];
+    logic [63:0] r_val_w;
+    logic [63:0] x_out_w [0:2];
+    logic [63:0] P_out_w [0:8];
 
-    axilite_slave #(
-        .ADDR_WIDTH (ADDR_WIDTH),
-        .DATA_WIDTH (DATA_WIDTH)
-    ) u_slave (
+    // SPI slave
+    spi_slave u_spi (
         .clk        (clk),
         .rst_n      (rst_n),
-        .s_awaddr   (s_awaddr),  .s_awvalid (s_awvalid), .s_awready (s_awready),
-        .s_wdata    (s_wdata),   .s_wstrb   (s_wstrb),
-        .s_wvalid   (s_wvalid),  .s_wready  (s_wready),
-        .s_bresp    (s_bresp),   .s_bvalid  (s_bvalid),  .s_bready  (s_bready),
-        .s_araddr   (s_araddr),  .s_arvalid (s_arvalid), .s_arready (s_arready),
-        .s_rdata    (s_rdata),   .s_rresp   (s_rresp),
-        .s_rvalid   (s_rvalid),  .s_rready  (s_rready),
+        .sclk       (sclk),
+        .mosi       (mosi),
+        .cs_n       (cs_n),
+        .miso       (miso),
         .core_start (core_start),
-        .core_rst_n (core_rst_n),
-        .core_A     (slave_A),
-        .core_B     (slave_B),
-        .core_R     (r_wire),
-        .core_C     (slave_C),
-        .core_x_out (x_out),     // x_out readable at A_REG[4:6] (0x30–0x40)
-        .core_done  (core_done),
-        .core_busy  (core_busy)
+        .sw_rst     (sw_rst_w),
+        .z_reg      (z_w),
+        .x_in_reg   (x_in_w),
+        .P_in_reg   (P_in_w),
+        .r_val      (r_val_w),
+        .done       (core_done),
+        .busy       (core_busy),
+        .x_out      (x_out_w),
+        .P_out      (P_out_w)
     );
 
+    // Kalman update core; soft-reset via sw_rst from SPI slave
     kalman_update u_core (
-        .clk   (clk),
-        .rst_n (core_rst_n),
-        .start (core_start),
-        .z     (slave_A[0]),
-        .x_in  (x_in_wire),
-        .P_in  (slave_B),
-        .r_val (r_wire),
-        .x_out (x_out),
-        .P_out (P_out),
-        .done  (core_done),
-        .busy  (core_busy)
+        .clk    (clk),
+        .rst_n  (rst_n & ~sw_rst_w),
+        .start  (core_start),
+        .z      (z_w),
+        .x_in   (x_in_w),
+        .P_in   (P_in_w),
+        .r_val  (r_val_w),
+        .x_out  (x_out_w),
+        .P_out  (P_out_w),
+        .done   (core_done),
+        .busy   (core_busy)
     );
+
+    // Status outputs
+    assign uo_out = {6'b0, core_done, core_busy};
+
+    // Suppress unused port warning
+    logic _ena_unused;
+    assign _ena_unused = ena;
+    logic [7:0] _ui_unused;
+    assign _ui_unused = ui_in;
 
 endmodule

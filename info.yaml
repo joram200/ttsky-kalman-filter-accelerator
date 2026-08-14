@@ -5,7 +5,7 @@ project:
   discord:      "epitimosellinas"      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
   description:  "A hardware accelerator for the measurement update in the basic kalman filter algorithm"      # One line description of what your project does
   language:     "SystemVerilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
-  clock_hz:     13000000       # Clock frequency in Hz (or 0 if not applicable)
+  clock_hz:     50000000       # Clock frequency in Hz (or 0 if not applicable)
 
   # How many tiles your design occupies? A single tile is about 167x108 uM.
   tiles: "1x1"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
@@ -35,8 +35,8 @@ pinout:
   ui[7]: ""
 
   # Outputs
-  uo[0]: ""
-  uo[1]: ""
+  uo[0]: "busy"
+  uo[1]: "done"
   uo[2]: ""
   uo[3]: ""
   uo[4]: ""
@@ -45,10 +45,10 @@ pinout:
   uo[7]: ""
 
   # Bidirectional pins
-  uio[0]: ""
-  uio[1]: ""
-  uio[2]: ""
-  uio[3]: ""
+  uio[0]: "SCLK (SPI clock input)"
+  uio[1]: "MOSI (SPI data input)"
+  uio[2]: "MISO (SPI data output)"
+  uio[3]: "CS_N (SPI chip select, active low)"
   uio[4]: ""
   uio[5]: ""
   uio[6]: ""
