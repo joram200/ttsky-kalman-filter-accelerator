@@ -1,45 +1,38 @@
-# Makefile
-# See https://docs.cocotb.org/en/stable/quickstart.html for more info
+# test/Makefile — iverilog testbench using tb_top.sv
+#
+# Usage (from repo root):  make -C test
+# Usage (from test/):      make
+#
+# Requires: iverilog (>= 12.0), vvp
+#
+# The testbench (tb_top.sv) uses $fatal for failures and $finish for pass.
+# vvp exits non-zero on $fatal, zero on $finish. results.xml is generated
+# so the upstream CI test-summary action still works.
 
-# defaults
-SIM ?= icarus
-FST ?= -fst # Use more efficient FST format
-TOPLEVEL_LANG ?= verilog
-SRC_DIR = $(PWD)/../src
-PROJECT_SOURCES = top.sv interface.sv compute_core.sv
+SRC_DIR := ../src
+TB      := tb_top.sv
+SRCS    := $(SRC_DIR)/compute_core.sv $(SRC_DIR)/interface.sv $(SRC_DIR)/top.sv
+VVP     := sim.vvp
 
-ifneq ($(GATES),yes)
+.PHONY: all clean
 
-# RTL simulation:
-SIM_BUILD				= sim_build/rtl
-VERILOG_SOURCES += $(addprefix $(SRC_DIR)/,$(PROJECT_SOURCES))
+all: results.xml
 
-else
+$(VVP): $(SRCS) $(TB)
+	iverilog -g2012 -Wall -Wno-sensitivity-entire-array \
+	    -I$(SRC_DIR) -o $@ -s tb_top $(TB) $(SRCS)
 
-# Gate level simulation:
-SIM_BUILD				= sim_build/gl
-COMPILE_ARGS    += -DGL_TEST
-COMPILE_ARGS    += -DFUNCTIONAL
-COMPILE_ARGS    += -DUSE_POWER_PINS
-COMPILE_ARGS    += -DSIM
-COMPILE_ARGS    += -DUNIT_DELAY=\#1
-VERILOG_SOURCES += $(PDK_ROOT)/sky130A/libs.ref/sky130_fd_sc_hd/verilog/primitives.v
-VERILOG_SOURCES += $(PDK_ROOT)/sky130A/libs.ref/sky130_fd_sc_hd/verilog/sky130_fd_sc_hd.v
+results.xml: $(VVP)
+	@if vvp $< -fst > sim.log 2>&1; then \
+	    cat sim.log; \
+	    printf '<?xml version="1.0"?>\n<testsuites><testsuite name="tb_top" tests="1" failures="0"><testcase name="test_kalman_spi"/></testsuite></testsuites>\n' > $@; \
+	    echo "RESULT: PASS"; \
+	else \
+	    cat sim.log; \
+	    printf '<?xml version="1.0"?>\n<testsuites><testsuite name="tb_top" tests="1" failures="1"><testcase name="test_kalman_spi"><failure message="simulation failed — see sim.log"/></testcase></testsuite></testsuites>\n' > $@; \
+	    echo "RESULT: FAIL"; \
+	    exit 1; \
+	fi
 
-# this gets copied in by the GDS action workflow
-VERILOG_SOURCES += $(PWD)/gate_level_netlist.v
-
-endif
-
-# Allow sharing configuration between design and testbench via `include`:
-COMPILE_ARGS 		+= -I$(SRC_DIR)
-
-# Include the testbench sources:
-VERILOG_SOURCES += $(PWD)/tb.v
-TOPLEVEL = tb
-
-# List test modules to run, separated by commas and without the .py suffix:
-COCOTB_TEST_MODULES = test
-
-# include cocotb's make rules to take care of the simulator setup
-include $(shell cocotb-config --makefiles)/Makefile.sim
+clean:
+	rm -f $(VVP) sim.log results.xml tb_top.fst

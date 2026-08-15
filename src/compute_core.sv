@@ -408,6 +408,7 @@ module kalman_update (
         NR0    = 4'd3,   // Newton-Raphson iteration 0: x = x0*(2 - S*x0)
         NR1    = 4'd4,   // NR iteration 1
         NR2    = 4'd5,   // NR iteration 2
+        NR3    = 4'd11,  // NR iteration 3 (4th total — needed for ULP precision)
         K_COMP = 4'd6,   // K[i] = P_in[i*3] * S_inv
         X_CORR = 4'd7,   // x_out[i] = x_in[i] + K[i]*y_tilde
         P_UPD  = 4'd8,   // Build IKH, fire gemm_systolic(IKH, P_in)
@@ -517,7 +518,8 @@ module kalman_update (
             S_COMP:               state_nxt = NR0;
             NR0:                  state_nxt = NR1;
             NR1:                  state_nxt = NR2;
-            NR2:                  state_nxt = K_COMP;
+            NR2:                  state_nxt = NR3;
+            NR3:                  state_nxt = K_COMP;
             K_COMP:               state_nxt = X_CORR;
             X_CORR:               state_nxt = P_UPD;
             P_UPD:                state_nxt = WAIT_P;
@@ -537,6 +539,19 @@ module kalman_update (
     function automatic logic [63:0] nr_seed (input logic [63:0] s);
         nr_seed = 64'h7FDE_6000_0000_0000 - s;
     endfunction
+
+    // Pre-computed negations as continuous wires to avoid f64_neg() calls
+    // inside always_ff (iverilog 12 "sorry" fix: function body has constant
+    // bit-selects x[63], x[62:0] which are mangled when inlined in always_*).
+    wire [63:0] neg_k1 = {~K_reg[1][63], K_reg[1][62:0]};
+    wire [63:0] neg_k2 = {~K_reg[2][63], K_reg[2][62:0]};
+
+    // Combinational y_tilde and S_comb instances (driven from registered values).
+    // Declared HERE (before the always_ff that reads S_comb) because iverilog 12
+    // requires declaration before use in procedural contexts.
+    logic [63:0] y_tilde_comb, S_comb;
+    f64_add u_ytilde (.a(z_reg),    .b(f64_neg(x_reg[0])), .result(y_tilde_comb));
+    f64_add u_scomb  (.a(P_reg[0]), .b(r_val),              .result(S_comb));
 
     // FSM datapath
     integer ii;
@@ -574,8 +589,8 @@ module kalman_update (
                 end
 
                 S_COMP: begin
-                    nr_x <= nr_seed(P_reg[0]);  // seed for S = P_in[0]+r_val; use P_reg[0] as proxy
-                    // y_tilde and S_reg set via comb instances below
+                    nr_x <= nr_seed(S_comb);    // seed ≈ 1/S from the combinational S adder
+                    // y_tilde and S_reg also latched this cycle via the second always_ff below
                 end
 
                 NR0: begin
@@ -589,7 +604,12 @@ module kalman_update (
                 end
 
                 NR2: begin
+                    nr_x  <= nr_x_new;
                     S_inv <= nr_x_new;
+                end
+
+                NR3: begin
+                    S_inv <= nr_x_new;  // final iteration: latch result only
                 end
 
                 K_COMP: begin
@@ -609,10 +629,10 @@ module kalman_update (
                     IKH[0] <= one_minus_k0;
                     IKH[1] <= 64'h0;
                     IKH[2] <= 64'h0;
-                    IKH[3] <= f64_neg(K_reg[1]);
+                    IKH[3] <= neg_k1;
                     IKH[4] <= F64_ONE;
                     IKH[5] <= 64'h0;
-                    IKH[6] <= f64_neg(K_reg[2]);
+                    IKH[6] <= neg_k2;
                     IKH[7] <= 64'h0;
                     IKH[8] <= F64_ONE;
                 end
@@ -641,11 +661,6 @@ module kalman_update (
             endcase
         end
     end
-
-    // Combinational y_tilde and S_comb instances (driven from registered values)
-    logic [63:0] y_tilde_comb, S_comb;
-    f64_add u_ytilde (.a(z_reg),    .b(f64_neg(x_reg[0])), .result(y_tilde_comb));
-    f64_add u_scomb  (.a(P_reg[0]), .b(r_val),              .result(S_comb));
 
     // Latch y_tilde and S_reg in S_COMP (one cycle after INNOV so that z_reg,
     // x_reg, and P_reg have settled from their NBA updates in INNOV).
