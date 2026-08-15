@@ -177,10 +177,19 @@ module spi_slave (
         endcase
     endfunction
 
-    // Pre-compute next-shift and miso-hold as continuous wires so that the
+    // Pre-compute ALL constant bit/range-selects as continuous wires so that the
     // always_ff block contains NO constant bit-selects (iverilog 12 "sorry" fix).
     wire [63:0] tx_shift_shifted = {tx_shift[62:0], 1'b0};
     wire        miso_hold        = tx_shift[63];  // MSB captured before shift
+
+    // rx_byte slices
+    wire [6:0] rx_byte_lo   = rx_byte[6:0];  // shift-in concatenation
+    wire       rx_byte_b6   = rx_byte[6];    // R/W flag (MSB after 7 shifts)
+    wire [5:0] rx_byte_b5_0 = rx_byte[5:0];  // lower 6 bits of address
+    wire       rx_byte_b0   = rx_byte[0];    // bit 0 → sw_rst
+
+    // rx_acc slice
+    wire [47:0] rx_acc_lo   = rx_acc[47:0];  // lower 48 bits for byte packing
 
     // -------------------------------------------------------------------------
     // Main sequential block
@@ -242,23 +251,23 @@ module spi_slave (
                     // ST_CMD: receive 8-bit command byte
                     // --------------------------------------------------------
                     ST_CMD: begin
-                        rx_byte <= {rx_byte[6:0], mosi_r};
+                        rx_byte <= {rx_byte_lo, mosi_r};
                         if (bit_cnt == 3'd7) begin
-                            // Full command byte assembled: {rx_byte[6:0], mosi_r}
-                            // bit[7] = MSB = rw (rx_byte[6] after 7 shifts)
-                            // bits[6:0] = addr ({rx_byte[5:0], mosi_r})
-                            rw       <= rx_byte[6];
-                            cur_addr <= {rx_byte[5:0], mosi_r};
+                            // Full command byte assembled: {rx_byte_lo, mosi_r}
+                            // bit[7] = MSB = rw (rx_byte_b6 after 7 shifts)
+                            // bits[6:0] = addr ({rx_byte_b5_0, mosi_r})
+                            rw       <= rx_byte_b6;
+                            cur_addr <= {rx_byte_b5_0, mosi_r};
                             st       <= ST_DATA;
                             bit_cnt  <= 3'd0;
                             byte_cnt <= 3'd0;
                             rx_byte  <= 8'h0;
                             rx_acc   <= 56'h0;
                             // For reads: pre-load the MISO shift register
-                            if (!rx_byte[6]) begin
-                                tx_shift <= reg_read_fn({rx_byte[5:0], mosi_r});
+                            if (!rx_byte_b6) begin
+                                tx_shift <= reg_read_fn({rx_byte_b5_0, mosi_r});
                                 // Clear done_latch if reading STAT
-                                if ({rx_byte[5:0], mosi_r} == 7'd1) done_latch <= 1'b0;
+                                if ({rx_byte_b5_0, mosi_r} == 7'd1) done_latch <= 1'b0;
                             end
                         end else begin
                             bit_cnt <= bit_cnt + 3'd1;
@@ -269,7 +278,7 @@ module spi_slave (
                     // ST_DATA: receive/transmit 64-bit register words
                     // --------------------------------------------------------
                     ST_DATA: begin
-                        rx_byte <= {rx_byte[6:0], mosi_r};
+                        rx_byte <= {rx_byte_lo, mosi_r};
                         if (bit_cnt == 3'd7) begin
                             bit_cnt <= 3'd0;
                             if (byte_cnt == 3'd7) begin
@@ -278,30 +287,30 @@ module spi_slave (
                                 rx_acc   <= 56'h0;
                                 rx_byte  <= 8'h0;
                                 if (rw) begin
-                                    // Full word: {rx_acc[55:0], rx_byte[6:0], mosi_r}
+                                    // Full word: {rx_acc, rx_byte_lo, mosi_r}
                                     // (rx_acc and rx_byte hold OLD values; NBAs haven't fired)
                                     case (cur_addr)
                                         7'd0: begin
                                             // CTRL: bit[0]=start, bit[1]=sw_rst
                                             // Last bit received = mosi_r = word bit[0]
-                                            // Second-to-last = rx_byte[0] = word bit[1]
+                                            // Second-to-last = rx_byte_b0 = word bit[1]
                                             core_start <= mosi_r;
-                                            sw_rst     <= rx_byte[0];
+                                            sw_rst     <= rx_byte_b0;
                                         end
-                                        7'd2:  z_reg         <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd3:  x_in_arr[0]   <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd4:  x_in_arr[1]   <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd5:  x_in_arr[2]   <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd9:  P_in_arr[0]   <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd10: P_in_arr[1]   <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd11: P_in_arr[2]   <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd12: P_in_arr[3]   <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd13: P_in_arr[4]   <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd14: P_in_arr[5]   <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd15: P_in_arr[6]   <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd16: P_in_arr[7]   <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd17: P_in_arr[8]   <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd27: r_val         <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd2:  z_reg         <= {rx_acc, rx_byte_lo, mosi_r};
+                                        7'd3:  x_in_arr[0]   <= {rx_acc, rx_byte_lo, mosi_r};
+                                        7'd4:  x_in_arr[1]   <= {rx_acc, rx_byte_lo, mosi_r};
+                                        7'd5:  x_in_arr[2]   <= {rx_acc, rx_byte_lo, mosi_r};
+                                        7'd9:  P_in_arr[0]   <= {rx_acc, rx_byte_lo, mosi_r};
+                                        7'd10: P_in_arr[1]   <= {rx_acc, rx_byte_lo, mosi_r};
+                                        7'd11: P_in_arr[2]   <= {rx_acc, rx_byte_lo, mosi_r};
+                                        7'd12: P_in_arr[3]   <= {rx_acc, rx_byte_lo, mosi_r};
+                                        7'd13: P_in_arr[4]   <= {rx_acc, rx_byte_lo, mosi_r};
+                                        7'd14: P_in_arr[5]   <= {rx_acc, rx_byte_lo, mosi_r};
+                                        7'd15: P_in_arr[6]   <= {rx_acc, rx_byte_lo, mosi_r};
+                                        7'd16: P_in_arr[7]   <= {rx_acc, rx_byte_lo, mosi_r};
+                                        7'd17: P_in_arr[8]   <= {rx_acc, rx_byte_lo, mosi_r};
+                                        7'd27: r_val         <= {rx_acc, rx_byte_lo, mosi_r};
                                         default: ;
                                     endcase
                                 end
@@ -314,7 +323,7 @@ module spi_slave (
                                 end
                             end else begin
                                 // Pack completed byte into rx_acc (bytes 0..6)
-                                rx_acc   <= {rx_acc[47:0], rx_byte[6:0], mosi_r};
+                                rx_acc   <= {rx_acc_lo, rx_byte_lo, mosi_r};
                                 byte_cnt <= byte_cnt + 3'd1;
                                 rx_byte  <= 8'h0;
                             end
