@@ -177,14 +177,10 @@ module spi_slave (
         endcase
     endfunction
 
-    // -------------------------------------------------------------------------
-    // MISO driven continuously from MSB of tx_shift (fix for iverilog constant
-    // bit-select in always_ff).
-    // -------------------------------------------------------------------------
-    assign miso = tx_shift[63];
-
-    // tx_shift left-shift helper: avoids constant bit-select inside always_ff
+    // Pre-compute next-shift and miso-hold as continuous wires so that the
+    // always_ff block contains NO constant bit-selects (iverilog 12 "sorry" fix).
     wire [63:0] tx_shift_shifted = {tx_shift[62:0], 1'b0};
+    wire        miso_hold        = tx_shift[63];  // MSB captured before shift
 
     // -------------------------------------------------------------------------
     // Main sequential block
@@ -199,6 +195,7 @@ module spi_slave (
             rx_byte    <= 8'h0;
             rx_acc     <= 56'h0;
             tx_shift   <= 64'h0;
+            miso       <= 1'b0;
             done_latch <= 1'b0;
             core_start <= 1'b0;
             sw_rst     <= 1'b0;
@@ -330,9 +327,10 @@ module spi_slave (
                 endcase
             end
 
-            // SCLK falling edge: shift tx_shift left (CPHA=0 convention)
-            // miso is driven continuously from tx_shift[63] via assign above
+            // SCLK falling edge: latch miso_hold (pre-shift MSB) then shift.
+            // Uses wires, not constant bit-selects, so no iverilog "sorry".
             if (sclk_fall && cs_active) begin
+                miso     <= miso_hold;
                 tx_shift <= tx_shift_shifted;
             end
         end
