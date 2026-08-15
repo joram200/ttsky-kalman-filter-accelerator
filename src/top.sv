@@ -1,6 +1,7 @@
 `timescale 1ns/1ps
 // =============================================================================
 // top.sv — Tiny Tapeout standard top-level wrapper for tt_um_joram200
+// Task 5 Option A: internal data widths changed to F32 (32-bit per element).
 //
 // Instantiates:
 //   u_spi  spi_slave     (interface.sv) — SPI register file, 28 registers
@@ -42,13 +43,13 @@ module tt_um_joram200 (
     logic        core_start, sw_rst_w;
     logic        core_done,  core_busy;
 
-    // Register file wires — flat packed to match updated port types
-    logic [63:0]  z_w;
-    logic [191:0] x_in_w;   // was logic [63:0] x_in_w [0:2]
-    logic [575:0] P_in_w;   // was logic [63:0] P_in_w [0:8]
-    logic [63:0]  r_val_w;
-    logic [191:0] x_out_w;  // was logic [63:0] x_out_w [0:2]
-    logic [575:0] P_out_w;  // was logic [63:0] P_out_w [0:8]
+    // Register file wires — F32 widths
+    logic [31:0]  z_w;
+    logic [95:0]  x_in_w;   // 3×32
+    logic [287:0] P_in_w;   // 9×32
+    logic [31:0]  r_val_w;
+    logic [95:0]  x_out_w;  // 3×32
+    logic [287:0] P_out_w;  // 9×32
 
     // SPI slave
     spi_slave u_spi (
