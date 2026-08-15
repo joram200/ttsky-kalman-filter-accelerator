@@ -1,17 +1,12 @@
 `timescale 1ns/1ps
 // =============================================================================
 // compute_core.sv — F32 + Time-multiplexed compute core for tt_um_joram200
-// Task 6: Combines F32 arithmetic (Task 5 Option A) with time-multiplexed
-//         FSM structure (Task 5 Option B) for maximum area reduction.
-// Module hierarchy (dependency order):
-//   f32_mul       — Combinational IEEE-754 F32 multiplier (24×24-bit)
-//   f32_add       — Combinational IEEE-754 F32 adder/subtractor
-//   gemm_systolic — 3×3 GEMM, 1 shared f32_mul+add, 27-cycle COMPUTE state
-//   kalman_update — Kalman update, 1 shared f32_mul, sub-cycle FSM expansion
+// Task 6 (iteration 2): F32 arithmetic, 1 shared mul+add per module,
+//   combinational IKH/P forwarding, eliminated redundant register banks.
 //
-// Area reduction vs baseline (18 f64_mul parallel):
-//   Arithmetic: F64 53×53-bit → F32 24×24-bit (area ~(24/53)²≈0.205 of F64)
-//   Structure: 18 f32_mul → 2 shared (one per module)
+// Area reductions vs task6 iter1 (1849%):
+//   kalman: 7 parallel f32_add → 1 shared; IKH/P_out_arr/gs_A/gs_B eliminated
+//   gemm:   A_reg/B_reg/C_arr eliminated; C driven directly from acc
 // =============================================================================
 
 // -----------------------------------------------------------------------------
@@ -155,34 +150,39 @@ module f32_add (
     end
 
     assign shifted  = sum_raw[23:0] << lz_count;
-    assign res_exp  = sum_raw[24] ? ({1'b0, big_exp} + 9'd1)                  :
-                      sum_raw[23] ? {1'b0, big_exp}                             :
+    assign res_exp  = sum_raw[24] ? ({1'b0, big_exp} + 9'd1)           :
+                      sum_raw[23] ? {1'b0, big_exp}                      :
                                     ({1'b0, big_exp} - {4'b0, lz_count});
     assign res_man  = sum_raw[24] ? sum_raw[23:1]  :
                       sum_raw[23] ? sum_raw[22:0]  :
                                     shifted[22:0];
 
     assign result =
-        (a_nan || b_nan)                          ? 32'h7FC0_0000 :
-        (a_inf && b_inf && (a_sign != b_sign))    ? 32'h7FC0_0000 :
-        (a_inf || b_inf)                          ? (a_inf ? a : b)      :
-        (a_zero && b_zero)                        ? 32'h0                :
-        a_zero                                    ? b                    :
-        b_zero                                    ? a                    :
-        (sum_raw == 25'h0)                        ? 32'h0                :
-        (res_exp[8] || (res_exp == 9'h0))         ? {r_sign, 31'b0}     :
-        (res_exp >= 9'h0FF)                       ? {r_sign, 8'hFF, 23'h0} :
+        (a_nan || b_nan)                          ? 32'h7FC0_0000           :
+        (a_inf && b_inf && (a_sign != b_sign))    ? 32'h7FC0_0000           :
+        (a_inf || b_inf)                          ? (a_inf ? a : b)         :
+        (a_zero && b_zero)                        ? 32'h0                   :
+        a_zero                                    ? b                       :
+        b_zero                                    ? a                       :
+        (sum_raw == 25'h0)                        ? 32'h0                   :
+        (res_exp[8] || (res_exp == 9'h0))         ? {r_sign, 31'b0}         :
+        (res_exp >= 9'h0FF)                       ? {r_sign, 8'hFF, 23'h0}  :
                                                     {r_sign, res_exp[7:0], res_man};
 
 endmodule
 
 // -----------------------------------------------------------------------------
-// gemm_systolic — 3×3 matrix multiply C=A×B, time-multiplexed (F32)
+// gemm_systolic — 3×3 matrix multiply C=A×B, time-multiplexed (F32, iter2)
 // 1 shared f32_mul + 1 shared f32_add; COMPUTE runs 27 cycles.
 // Counter order: k (outer, 0→2), i (middle, 0→2), j (inner, 0→2).
-// Each COMPUTE cycle: acc[i*3+j] += A_reg[i*3+k] × B_reg[k*3+j]
-// FSM: IDLE → LOAD → COMPUTE(27 cy) → FINISH → IDLE
-// Ports A, B, C are flat packed vectors (9×32=288 bits) for Yosys compatibility.
+// Each COMPUTE cycle: acc[i*3+j] += A_in[i*3+k] × B_in[k*3+j]
+//
+// Eliminated vs iter1: A_reg, B_reg, C_arr (read inputs directly; C from acc).
+// A and B inputs must remain stable from gs_start through gs_done (guaranteed
+// by kalman_update: gs_A_flat/gs_B_flat are combinational wires from
+// stable K_reg/P_reg during WAIT_P).
+//
+// Ports A, B, C are flat packed (9×32=288 bits) for Yosys compatibility.
 // -----------------------------------------------------------------------------
 module gemm_systolic (
     input  logic        clk,
@@ -204,7 +204,7 @@ module gemm_systolic (
 
     gstate_t gstate, gstate_nxt;
 
-    // Unpack flat inputs to internal unpacked arrays
+    // Unpack flat inputs to wire arrays (no registered copies)
     logic [31:0] A_in [0:8];
     logic [31:0] B_in [0:8];
     genvar unp;
@@ -215,16 +215,13 @@ module gemm_systolic (
         end
     endgenerate
 
-    logic [31:0] C_arr [0:8];
+    // acc is the working accumulator; C driven directly from acc (no C_arr)
+    logic [31:0] acc [0:8];
     generate
         for (unp = 0; unp < 9; unp++) begin : pack_out
-            assign C[unp*32 +: 32] = C_arr[unp];
+            assign C[unp*32 +: 32] = acc[unp];
         end
     endgenerate
-
-    logic [31:0] A_reg [0:8];
-    logic [31:0] B_reg [0:8];
-    logic [31:0] acc   [0:8];
 
     // Counters: k=outer(0..2), i=middle(0..2), j=inner(0..2)
     logic [1:0] k_cnt, i_cnt, j_cnt;
@@ -235,10 +232,10 @@ module gemm_systolic (
     assign b_idx   = {2'b0, k_cnt} * 4'd3 + {2'b0, j_cnt};
     assign acc_idx = {2'b0, i_cnt} * 4'd3 + {2'b0, j_cnt};
 
-    // 1 shared multiplier + 1 shared adder
+    // 1 shared multiplier + 1 shared adder; reads directly from input wires
     logic [31:0] gmul_out, gadd_out;
-    f32_mul u_gmul (.a(A_reg[a_idx]), .b(B_reg[b_idx]), .result(gmul_out));
-    f32_add u_gadd (.a(acc[acc_idx]), .b(gmul_out),     .result(gadd_out));
+    f32_mul u_gmul (.a(A_in[a_idx]), .b(B_in[b_idx]), .result(gmul_out));
+    f32_add u_gadd (.a(acc[acc_idx]), .b(gmul_out),   .result(gadd_out));
 
     // All-done flag for COMPUTE state
     wire g_compute_done = (k_cnt == 2'd2) && (i_cnt == 2'd2) && (j_cnt == 2'd2);
@@ -260,27 +257,18 @@ module gemm_systolic (
         if (!rst_n) begin
             gstate <= IDLE;
             k_cnt  <= 2'd0; i_cnt <= 2'd0; j_cnt <= 2'd0;
-            for (gi = 0; gi < 9; gi++) begin
-                A_reg[gi] <= 32'h0;
-                B_reg[gi] <= 32'h0;
-                acc[gi]   <= 32'h0;
-                C_arr[gi] <= 32'h0;
-            end
+            for (gi = 0; gi < 9; gi++) acc[gi] <= 32'h0;
         end else begin
             gstate <= gstate_nxt;
 
             case (gstate)
                 LOAD: begin
-                    for (gi = 0; gi < 9; gi++) begin
-                        A_reg[gi] <= A_in[gi];
-                        B_reg[gi] <= B_in[gi];
-                        acc[gi]   <= 32'h0;
-                    end
+                    // Zero accumulators; inputs read directly in COMPUTE
+                    for (gi = 0; gi < 9; gi++) acc[gi] <= 32'h0;
                     k_cnt <= 2'd0; i_cnt <= 2'd0; j_cnt <= 2'd0;
                 end
 
                 COMPUTE: begin
-                    // Accumulate partial product into the correct output element
                     acc[acc_idx] <= gadd_out;
 
                     // Advance counters: j fastest, then i, then k
@@ -298,9 +286,9 @@ module gemm_systolic (
                     end
                 end
 
-                FINISH: begin
-                    for (gi = 0; gi < 9; gi++) C_arr[gi] <= acc[gi];
-                end
+                // FINISH: acc holds final result; C is driven combinationally
+                // from acc so no copy needed. Stays stable until next LOAD.
+                FINISH: ;
 
                 default: ;
             endcase
@@ -313,17 +301,24 @@ module gemm_systolic (
 endmodule
 
 // -----------------------------------------------------------------------------
-// kalman_update — Kalman filter update kernel, time-multiplexed (F32)
+// kalman_update — Kalman filter update kernel, time-multiplexed (F32, iter2)
 // H = [1, 0, 0] (scalar measurement)
 //
-// Area reduction: 1 shared f32_mul (vs 9 direct instances in Option A baseline).
-// 7 f32_add instances retained: u_nr_sub, u_xo0/1/2, u_1mk0, u_ytilde, u_scomb.
+// vs iter1: 7 parallel f32_add → 1 shared u_shared_add.
+//   IKH, P_out_arr, gs_A, gs_B registers eliminated:
+//     IKH     → one_minus_k0_r (single reg) + combinational wires
+//     P_out   → driven directly from gs_C_flat (gemm output)
+//     gs_A_flat → combinational from K_reg + one_minus_k0_r
+//     gs_B_flat → combinational from P_reg
 //
 // FSM (sub-cycles in parentheses):
-//   IDLE→INNOV(1)→S_COMP(1)→NR0(2)→NR1(2)→NR2(2)→NR3(2)
-//   →K_COMP(3)→KY_COMP(3)→X_ADD(1)→P_UPD(1)→WAIT_P→DONE_S→IDLE
+//   IDLE→INNOV(1)→S_COMP(2)→NR0(2)→NR1(2)→NR2(2)→NR3(2)
+//   →K_COMP(3)→KY_COMP(3)→X_ADD(4)→P_UPD(1)→WAIT_P→DONE_S→IDLE
 //
-// Ports x_in, P_in, x_out, P_out are flat packed vectors for Yosys.
+// NR sub=1: shared_add(F32_TWO,-sx_reg) chains into shared_mul(nr_x,add_out)
+//           within one clock cycle (both combinational, latched at posedge).
+//
+// Ports x_in, P_in, x_out, P_out are flat packed for Yosys.
 // -----------------------------------------------------------------------------
 module kalman_update (
     input  logic        clk,
@@ -346,22 +341,20 @@ module kalman_update (
     typedef enum logic [3:0] {
         IDLE    = 4'd0,
         INNOV   = 4'd1,   // latch z, x_in, P_in
-        S_COMP  = 4'd2,   // latch nr_x seed, y_tilde, S_reg
+        S_COMP  = 4'd2,   // 2 sub-cycles: y_tilde then S_reg+nr_x seed
         NR0     = 4'd3,   // NR iteration 0 (2 sub-cycles)
         NR1     = 4'd4,   // NR iteration 1
         NR2     = 4'd5,   // NR iteration 2
         NR3     = 4'd11,  // NR iteration 3 (final)
         K_COMP  = 4'd6,   // K[i] = P_in[i*3] * S_inv (3 sub-cycles)
         KY_COMP = 4'd7,   // ky[i] = K[i] * y_tilde (3 sub-cycles)
-        X_ADD   = 4'd12,  // x_out[i] = x_reg[i] + ky[i], build IKH (1 cycle)
-        P_UPD   = 4'd8,   // Fire gemm_systolic(IKH, P_in)
+        X_ADD   = 4'd12,  // 4 sub-cycles: x_out[0..2] then one_minus_k0_r
+        P_UPD   = 4'd8,   // Fire gemm_systolic (gs_A_flat/gs_B_flat ready)
         WAIT_P  = 4'd9,   // Wait for gemm done
         DONE_S  = 4'd10
     } state_t;
 
     state_t state, state_nxt;
-
-    // Sub-cycle counter (max 2 for NR and KY_COMP; max 2 for K_COMP)
     logic [1:0] sub_cnt, sub_nxt;
 
     // Unpack flat input ports
@@ -378,16 +371,11 @@ module kalman_update (
         end
     endgenerate
 
-    // Internal unpacked output arrays; pack to flat ports
+    // x_out packed from x_out_arr; P_out driven directly from gemm C output
     logic [31:0] x_out_arr [0:2];
-    logic [31:0] P_out_arr [0:8];
-
     generate
         for (ku = 0; ku < 3; ku++) begin : pack_xout
             assign x_out[ku*32 +: 32] = x_out_arr[ku];
-        end
-        for (ku = 0; ku < 9; ku++) begin : pack_pout
-            assign P_out[ku*32 +: 32] = P_out_arr[ku];
         end
     endgenerate
 
@@ -396,27 +384,41 @@ module kalman_update (
     logic [31:0] x_reg  [0:2];
     logic [31:0] P_reg  [0:8];
     logic [31:0] K_reg  [0:2];
-    logic [31:0] IKH    [0:8];
-    logic [31:0] sx_reg;         // intermediate S*nr_x for NR iterations
-    logic [31:0] ky_arr [0:2];   // intermediate K[i]*y_tilde
-
-    // NR intermediate
+    logic [31:0] sx_reg;         // intermediate S*nr_x for NR
+    logic [31:0] ky_arr [0:2];   // K[i]*y_tilde
     logic [31:0] nr_x;
+    logic [31:0] one_minus_k0_r; // 1 - K[0], computed in X_ADD sub=3
 
     // gemm_systolic signals
     logic        gs_start, gs_done, gs_busy;
-    logic [31:0] gs_A [0:8], gs_B [0:8], gs_C [0:8];
-
     logic [287:0] gs_A_flat, gs_B_flat, gs_C_flat;
 
+    // gs_A_flat: IKH matrix, combinationally from K_reg and one_minus_k0_r
+    // IKH = (I - K*H) where H=[1,0,0]:
+    //   row0: [1-K[0], 0,      0     ]
+    //   row1: [-K[1],  1,      0     ]
+    //   row2: [-K[2],  0,      1     ]
+    // Stored column-major (element [i,j] = row i, col j → index i*3+j):
+    assign gs_A_flat[0*32 +: 32] = one_minus_k0_r;
+    assign gs_A_flat[1*32 +: 32] = 32'h0;
+    assign gs_A_flat[2*32 +: 32] = 32'h0;
+    assign gs_A_flat[3*32 +: 32] = {~K_reg[1][31], K_reg[1][30:0]};  // -K[1]
+    assign gs_A_flat[4*32 +: 32] = F32_ONE;
+    assign gs_A_flat[5*32 +: 32] = 32'h0;
+    assign gs_A_flat[6*32 +: 32] = {~K_reg[2][31], K_reg[2][30:0]};  // -K[2]
+    assign gs_A_flat[7*32 +: 32] = 32'h0;
+    assign gs_A_flat[8*32 +: 32] = F32_ONE;
+
+    // gs_B_flat: P_reg directly (stable during WAIT_P)
     genvar gk;
     generate
-        for (gk = 0; gk < 9; gk++) begin : gs_flat
-            assign gs_A_flat[gk*32 +: 32] = gs_A[gk];
-            assign gs_B_flat[gk*32 +: 32] = gs_B[gk];
-            assign gs_C[gk] = gs_C_flat[gk*32 +: 32];
+        for (gk = 0; gk < 9; gk++) begin : gs_b_flat
+            assign gs_B_flat[gk*32 +: 32] = P_reg[gk];
         end
     endgenerate
+
+    // P_out driven directly from gemm C output (stable after FINISH until next LOAD)
+    assign P_out = gs_C_flat;
 
     gemm_systolic u_gemm (
         .clk   (clk),
@@ -430,52 +432,78 @@ module kalman_update (
     );
 
     // -------------------------------------------------------------------------
-    // Shared multiplier: 1 f32_mul reused across NR, K_COMP, KY_COMP states.
-    // Inputs muxed by always_comb below; result = shared_r.
+    // Shared multiplier: 1 f32_mul, muxed inputs
     // -------------------------------------------------------------------------
     logic [31:0] shared_a, shared_b, shared_r;
     f32_mul u_shared_mul (.a(shared_a), .b(shared_b), .result(shared_r));
 
-    // Negate helper (F32: flip sign bit[31])
-    function automatic logic [31:0] f32_neg (input logic [31:0] x);
-        f32_neg = {~x[31], x[30:0]};
-    endfunction
+    // -------------------------------------------------------------------------
+    // Shared adder: 1 f32_add, muxed inputs
+    // In NR sub=1: output feeds shared_mul b-input (combinational chain).
+    // -------------------------------------------------------------------------
+    logic [31:0] shared_add_a, shared_add_b, shared_add_r;
+    f32_add u_shared_add (.a(shared_add_a), .b(shared_add_b), .result(shared_add_r));
 
     // Newton-Raphson seed: bit-trick 1/S approximation (F32)
     function automatic logic [31:0] nr_seed (input logic [31:0] s);
         nr_seed = 32'h7EF1_27EA - s;
     endfunction
 
-    // Pre-computed negations as continuous wires
-    wire [31:0] neg_sx_reg = {~sx_reg[31], sx_reg[30:0]};  // -sx_reg for u_nr_sub
-    wire [31:0] neg_k1     = {~K_reg[1][31], K_reg[1][30:0]};
-    wire [31:0] neg_k2     = {~K_reg[2][31], K_reg[2][30:0]};
+    // -------------------------------------------------------------------------
+    // Shared adder mux
+    // -------------------------------------------------------------------------
+    always_comb begin
+        shared_add_a = 32'h0;
+        shared_add_b = 32'h0;
+        case (state)
+            S_COMP: begin
+                if (sub_cnt == 2'd0) begin
+                    // sub 0: y_tilde = z_reg - x_reg[0]
+                    shared_add_a = z_reg;
+                    shared_add_b = {~x_reg[0][31], x_reg[0][30:0]};
+                end else begin
+                    // sub 1: S_comb = P_reg[0] + r_val
+                    shared_add_a = P_reg[0];
+                    shared_add_b = r_val;
+                end
+            end
+            NR0, NR1, NR2, NR3: begin
+                if (sub_cnt == 2'd1) begin
+                    // sub 1: two_minus_sx = F32_TWO - sx_reg
+                    // (feeds shared_mul b-input in same cycle)
+                    shared_add_a = F32_TWO;
+                    shared_add_b = {~sx_reg[31], sx_reg[30:0]};
+                end
+                // sub 0: adder idle
+            end
+            X_ADD: begin
+                case (sub_cnt)
+                    2'd0: begin
+                        shared_add_a = x_reg[0];
+                        shared_add_b = ky_arr[0];
+                    end
+                    2'd1: begin
+                        shared_add_a = x_reg[1];
+                        shared_add_b = ky_arr[1];
+                    end
+                    2'd2: begin
+                        shared_add_a = x_reg[2];
+                        shared_add_b = ky_arr[2];
+                    end
+                    2'd3: begin
+                        // one_minus_k0 = F32_ONE - K_reg[0]
+                        shared_add_a = F32_ONE;
+                        shared_add_b = {~K_reg[0][31], K_reg[0][30:0]};
+                    end
+                endcase
+            end
+            default: ;
+        endcase
+    end
 
     // -------------------------------------------------------------------------
-    // f32_add instances (7 total) — kept parallel, no time-multiplex needed.
-    // -------------------------------------------------------------------------
-
-    // NR: two_minus_sx = 2.0 - sx_reg
-    logic [31:0] two_minus_sx;
-    f32_add u_nr_sub  (.a(F32_TWO), .b(neg_sx_reg),          .result(two_minus_sx));
-
-    // x_out[i] = x_reg[i] + ky_arr[i]
-    logic [31:0] xout0, xout1, xout2;
-    f32_add u_xo0 (.a(x_reg[0]), .b(ky_arr[0]), .result(xout0));
-    f32_add u_xo1 (.a(x_reg[1]), .b(ky_arr[1]), .result(xout1));
-    f32_add u_xo2 (.a(x_reg[2]), .b(ky_arr[2]), .result(xout2));
-
-    // IKH[0,0] = 1 - K[0]
-    logic [31:0] one_minus_k0;
-    f32_add u_1mk0 (.a(F32_ONE), .b(f32_neg(K_reg[0])), .result(one_minus_k0));
-
-    // Combinational y_tilde and S_comb
-    logic [31:0] y_tilde_comb, S_comb;
-    f32_add u_ytilde (.a(z_reg),    .b(f32_neg(x_reg[0])), .result(y_tilde_comb));
-    f32_add u_scomb  (.a(P_reg[0]), .b(r_val),              .result(S_comb));
-
-    // -------------------------------------------------------------------------
-    // Shared multiplier mux (always_comb — no constant bit-selects)
+    // Shared multiplier mux
+    // NR sub=1: b = shared_add_r (two_minus_sx, combinational chain)
     // -------------------------------------------------------------------------
     always_comb begin
         shared_a = 32'h0;
@@ -483,19 +511,19 @@ module kalman_update (
         case (state)
             NR0, NR1, NR2, NR3: begin
                 if (sub_cnt == 2'd0) begin
-                    shared_a = S_reg;  // sub 0: compute S * nr_x → sx_reg
+                    shared_a = S_reg;   // sub 0: S_reg * nr_x → sx_reg
                     shared_b = nr_x;
                 end else begin
-                    shared_a = nr_x;             // sub 1: nr_x * (2 - sx) → new nr_x
-                    shared_b = two_minus_sx;
+                    shared_a = nr_x;          // sub 1: nr_x * (2-sx) → new nr_x
+                    shared_b = shared_add_r;  // two_minus_sx (combinational)
                 end
             end
             K_COMP: begin
                 shared_b = S_inv;
                 case (sub_cnt)
-                    2'd0: shared_a = P_reg[0];  // K[0] = P[0][0] * S_inv
-                    2'd1: shared_a = P_reg[3];  // K[1] = P[1][0] * S_inv
-                    2'd2: shared_a = P_reg[6];  // K[2] = P[2][0] * S_inv
+                    2'd0: shared_a = P_reg[0];
+                    2'd1: shared_a = P_reg[3];
+                    2'd2: shared_a = P_reg[6];
                     default: shared_a = 32'h0;
                 endcase
             end
@@ -528,18 +556,18 @@ module kalman_update (
                 else             sub_nxt = 2'd0;
             end
             INNOV:   begin state_nxt = S_COMP;  sub_nxt = 2'd0; end
-            S_COMP:  begin state_nxt = NR0;     sub_nxt = 2'd0; end
-            NR0:     if (sub_cnt == 2'd1) begin state_nxt = NR1;    sub_nxt = 2'd0; end
-            NR1:     if (sub_cnt == 2'd1) begin state_nxt = NR2;    sub_nxt = 2'd0; end
-            NR2:     if (sub_cnt == 2'd1) begin state_nxt = NR3;    sub_nxt = 2'd0; end
-            NR3:     if (sub_cnt == 2'd1) begin state_nxt = K_COMP; sub_nxt = 2'd0; end
+            S_COMP:  if (sub_cnt == 2'd1) begin state_nxt = NR0;     sub_nxt = 2'd0; end
+            NR0:     if (sub_cnt == 2'd1) begin state_nxt = NR1;     sub_nxt = 2'd0; end
+            NR1:     if (sub_cnt == 2'd1) begin state_nxt = NR2;     sub_nxt = 2'd0; end
+            NR2:     if (sub_cnt == 2'd1) begin state_nxt = NR3;     sub_nxt = 2'd0; end
+            NR3:     if (sub_cnt == 2'd1) begin state_nxt = K_COMP;  sub_nxt = 2'd0; end
             K_COMP:  if (sub_cnt == 2'd2) begin state_nxt = KY_COMP; sub_nxt = 2'd0; end
-            KY_COMP: if (sub_cnt == 2'd2) begin state_nxt = X_ADD;  sub_nxt = 2'd0; end
-            X_ADD:   begin state_nxt = P_UPD;   sub_nxt = 2'd0; end
+            KY_COMP: if (sub_cnt == 2'd2) begin state_nxt = X_ADD;   sub_nxt = 2'd0; end
+            X_ADD:   if (sub_cnt == 2'd3) begin state_nxt = P_UPD;   sub_nxt = 2'd0; end
             P_UPD:   begin state_nxt = WAIT_P;  sub_nxt = 2'd0; end
             WAIT_P:  begin
                 if (gs_done) begin state_nxt = DONE_S; sub_nxt = 2'd0; end
-                else              sub_nxt = 2'd0;  // hold counter at 0 while waiting
+                else              sub_nxt = 2'd0;
             end
             DONE_S:  begin state_nxt = IDLE;    sub_nxt = 2'd0; end
             default: begin state_nxt = IDLE;    sub_nxt = 2'd0; end
@@ -555,25 +583,20 @@ module kalman_update (
             state    <= IDLE;
             sub_cnt  <= 2'd0;
             gs_start <= 1'b0;
-            for (ii = 0; ii < 9; ii++) begin
-                gs_A[ii]  <= 32'h0;
-                gs_B[ii]  <= 32'h0;
-                IKH[ii]   <= 32'h0;
-                P_reg[ii] <= 32'h0;
-            end
+            for (ii = 0; ii < 9; ii++) P_reg[ii] <= 32'h0;
             for (ii = 0; ii < 3; ii++) begin
                 x_reg[ii]     <= 32'h0;
                 K_reg[ii]     <= 32'h0;
                 ky_arr[ii]    <= 32'h0;
                 x_out_arr[ii] <= 32'h0;
             end
-            for (ii = 0; ii < 9; ii++) P_out_arr[ii] <= 32'h0;
-            z_reg   <= 32'h0;
-            S_reg   <= 32'h0;
-            S_inv   <= 32'h0;
-            nr_x    <= 32'h0;
-            sx_reg  <= 32'h0;
-            y_tilde <= 32'h0;
+            z_reg          <= 32'h0;
+            S_reg          <= 32'h0;
+            S_inv          <= 32'h0;
+            nr_x           <= 32'h0;
+            sx_reg         <= 32'h0;
+            y_tilde        <= 32'h0;
+            one_minus_k0_r <= 32'h0;
         end else begin
             state   <= state_nxt;
             sub_cnt <= sub_nxt;
@@ -586,20 +609,25 @@ module kalman_update (
                     for (ii = 0; ii < 9; ii++) P_reg[ii] <= P_in_arr[ii];
                 end
 
+                // S_COMP: 2 sub-cycles using shared adder
+                // sub 0: y_tilde = z_reg - x_reg[0]
+                // sub 1: S_reg = P_reg[0] + r_val; nr_x = nr_seed(S_reg)
                 S_COMP: begin
-                    // Latch S, seed, y_tilde using combinational outputs
-                    nr_x    <= nr_seed(S_comb);
-                    y_tilde <= y_tilde_comb;
-                    S_reg   <= S_comb;
+                    if (sub_cnt == 2'd0) begin
+                        y_tilde <= shared_add_r;
+                    end else begin  // sub=1
+                        S_reg <= shared_add_r;
+                        nr_x  <= nr_seed(shared_add_r);
+                    end
                 end
 
                 // NR0..NR3: 2 sub-cycles each
-                // sub 0: shared_r = S_reg * nr_x → latch to sx_reg
-                // sub 1: shared_r = nr_x * (2 - sx_reg) → new nr_x (and S_inv for last)
+                // sub 0: sx_reg = S_reg * nr_x  (mul)
+                // sub 1: nr_x = nr_x * (2 - sx_reg)  (add chains into mul)
                 NR0, NR1, NR2: begin
                     if (sub_cnt == 2'd0) begin
                         sx_reg <= shared_r;
-                    end else begin  // sub_cnt == 1
+                    end else begin
                         nr_x  <= shared_r;
                         S_inv <= shared_r;
                     end
@@ -608,15 +636,12 @@ module kalman_update (
                 NR3: begin
                     if (sub_cnt == 2'd0) begin
                         sx_reg <= shared_r;
-                    end else begin  // sub_cnt == 1: final iteration
-                        S_inv <= shared_r;  // don't update nr_x (no more iterations)
+                    end else begin
+                        S_inv <= shared_r;
                     end
                 end
 
                 // K_COMP: 3 sub-cycles
-                // sub 0: K_reg[0] = P_reg[0] * S_inv
-                // sub 1: K_reg[1] = P_reg[3] * S_inv
-                // sub 2: K_reg[2] = P_reg[6] * S_inv
                 K_COMP: begin
                     case (sub_cnt)
                         2'd0: K_reg[0] <= shared_r;
@@ -627,9 +652,6 @@ module kalman_update (
                 end
 
                 // KY_COMP: 3 sub-cycles
-                // sub 0: ky_arr[0] = K_reg[0] * y_tilde
-                // sub 1: ky_arr[1] = K_reg[1] * y_tilde
-                // sub 2: ky_arr[2] = K_reg[2] * y_tilde
                 KY_COMP: begin
                     case (sub_cnt)
                         2'd0: ky_arr[0] <= shared_r;
@@ -639,39 +661,29 @@ module kalman_update (
                     endcase
                 end
 
-                // X_ADD: 1 cycle — ky_arr[0:2] are now populated
-                // x_out[i] = x_reg[i] + ky_arr[i] (via u_xo0/1/2 combinationally)
-                // Also build IKH = (I - K⊗H): H=[1,0,0]
+                // X_ADD: 4 sub-cycles using shared adder
+                // sub 0-2: x_out_arr[i] = x_reg[i] + ky_arr[i]
+                // sub 3:   one_minus_k0_r = 1.0 - K_reg[0]
+                //          (gs_A_flat[0] is driven from one_minus_k0_r combinationally)
                 X_ADD: begin
-                    x_out_arr[0] <= xout0;
-                    x_out_arr[1] <= xout1;
-                    x_out_arr[2] <= xout2;
-                    IKH[0] <= one_minus_k0;
-                    IKH[1] <= 32'h0;
-                    IKH[2] <= 32'h0;
-                    IKH[3] <= neg_k1;
-                    IKH[4] <= F32_ONE;
-                    IKH[5] <= 32'h0;
-                    IKH[6] <= neg_k2;
-                    IKH[7] <= 32'h0;
-                    IKH[8] <= F32_ONE;
+                    case (sub_cnt)
+                        2'd0: x_out_arr[0] <= shared_add_r;
+                        2'd1: x_out_arr[1] <= shared_add_r;
+                        2'd2: x_out_arr[2] <= shared_add_r;
+                        2'd3: one_minus_k0_r <= shared_add_r;
+                    endcase
                 end
 
+                // P_UPD: gs_A_flat and gs_B_flat are already driven combinationally.
+                // Just assert gs_start (gemm will latch A and B in its LOAD state).
                 P_UPD: begin
-                    for (ii = 0; ii < 9; ii++) begin
-                        gs_A[ii] <= IKH[ii];
-                        gs_B[ii] <= P_reg[ii];
-                    end
                     gs_start <= 1'b1;
                 end
 
-                WAIT_P: begin
-                    gs_start <= 1'b0;
-                end
+                WAIT_P: ;  // wait for gs_done
 
-                DONE_S: begin
-                    for (ii = 0; ii < 9; ii++) P_out_arr[ii] <= gs_C[ii];
-                end
+                // DONE_S: P_out is already driven from gs_C_flat (acc is stable).
+                DONE_S: ;
 
                 default: ;
             endcase
