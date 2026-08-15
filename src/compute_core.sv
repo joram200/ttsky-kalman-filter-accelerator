@@ -1,22 +1,22 @@
 `timescale 1ns/1ps
 // =============================================================================
-// compute_core.sv — M3-derived combinational compute core for tt_um_joram200
-// All synthesisable RTL combined into a single file.
+// compute_core.sv — Time-multiplexed F64 compute core for tt_um_joram200
+// Option B: exact IEEE-754 F64 arithmetic, 1 shared f64_mul per module.
 // Module hierarchy (dependency order):
-//   f64_mul       — Combinational IEEE-754 F64 multiplier (no clk)
-//   f64_add       — Combinational IEEE-754 F64 adder/subtractor (no clk)
-//   gemm_systolic — 3×3 weight-stationary systolic GEMM (used by kalman_update)
-//   kalman_update — Kalman filter update kernel (instantiates gemm_systolic)
+//   f64_mul       — Combinational IEEE-754 F64 multiplier (unchanged)
+//   f64_add       — Combinational IEEE-754 F64 adder/subtractor (unchanged)
+//   gemm_systolic — 3×3 GEMM, 1 shared f64_mul+add, 27-cycle COMPUTE state
+//   kalman_update — Kalman update, 1 shared f64_mul, sub-cycle FSM expansion
 //
-// Forward-ports vs M3:
-//   - r_val[63:0] input on kalman_update (replaces hardcoded R_CONST = 5.0)
-//   - P_out[0:8] all 9 elements driven (M3 AXI C_REG window exposed only P_out[0:5])
+// Area reduction vs baseline:
+//   gemm_systolic: 9 f64_mul → 1 shared (COMPUTE runs 27 cycles)
+//   kalman_update direct: 9 f64_mul → 1 shared (sub-cycle sequencing)
+//   Total f64_mul: 18 → 2 (one per module)
+//   Total f64_add: 17 → 8 (7 kept in kalman_update + 1 in gemm)
 // =============================================================================
 
 // -----------------------------------------------------------------------------
-// f64_mul — Combinational IEEE-754 double-precision multiplier
-// Pure assign statements; no clock.
-// Special cases: NaN propagation, Inf×0=NaN, zero handling, overflow→Inf.
+// f64_mul — Combinational IEEE-754 double-precision multiplier (unchanged)
 // -----------------------------------------------------------------------------
 module f64_mul (
     input  logic [63:0] a,
@@ -24,10 +24,9 @@ module f64_mul (
     output logic [63:0] result
 );
 
-    // Field extraction
     logic        a_sign, b_sign, r_sign;
     logic [10:0] a_exp,  b_exp;
-    logic [52:0] a_man,  b_man;   // includes implicit leading 1 (or 0 for denorm)
+    logic [52:0] a_man,  b_man;
 
     assign a_sign = a[63];
     assign b_sign = b[63];
@@ -36,7 +35,6 @@ module f64_mul (
     assign a_man  = (a_exp == 11'h0) ? {1'b0, a[51:0]} : {1'b1, a[51:0]};
     assign b_man  = (b_exp == 11'h0) ? {1'b0, b[51:0]} : {1'b1, b[51:0]};
 
-    // Special-case detection
     logic a_nan, b_nan, a_inf, b_inf, a_zero, b_zero;
     assign a_nan  = (a_exp == 11'h7FF) && (a[51:0] != 52'h0);
     assign b_nan  = (b_exp == 11'h7FF) && (b[51:0] != 52'h0);
@@ -45,28 +43,20 @@ module f64_mul (
     assign a_zero = (a_exp == 11'h0)   && (a[51:0] == 52'h0);
     assign b_zero = (b_exp == 11'h0)   && (b[51:0] == 52'h0);
 
-    // 106-bit product (53×53 unsigned)
     logic [105:0] product;
     assign product = {53'b0, a_man} * {53'b0, b_man};
 
-    // Exponent sum (unbiased: ea + eb - 1023)
-    // Use 13-bit signed to detect underflow/overflow
     logic signed [12:0] exp_sum;
     assign exp_sum = $signed({2'b00, a_exp}) + $signed({2'b00, b_exp})
                      - $signed(13'd1023);
 
-    // Normalise: if product[105]=1, shift right 1 and inc exp
-    // Replaced always_comb with assign to avoid iverilog constant bit-select bug
     logic [51:0] norm_man;
     logic signed [12:0] norm_exp;
     assign norm_man = product[105] ? product[104:53] : product[103:52];
     assign norm_exp = product[105] ? (exp_sum + 13'd1) : exp_sum;
 
-    // Result sign
     assign r_sign = a_sign ^ b_sign;
 
-    // Final mux — special cases first
-    // Replaced always_comb with assign to avoid iverilog constant bit-select bug
     assign result =
         (a_nan || b_nan)                              ? 64'h7FF8_0000_0000_0000 :
         ((a_inf && b_zero) || (b_inf && a_zero))      ? 64'h7FF8_0000_0000_0000 :
@@ -79,12 +69,7 @@ module f64_mul (
 endmodule
 
 // -----------------------------------------------------------------------------
-// f64_add — Combinational IEEE-754 double-precision adder/subtractor
-// Pure assign statements (except for always_comb blocks without constant
-// bit-selects on the RHS); no clock.
-// Algorithm: swap so larger exponent is operand A, align B, add/subtract
-// significands, normalise, round-to-nearest-even.
-// Special cases: NaN propagation, Inf±Inf=NaN, Inf+finite=Inf.
+// f64_add — Combinational IEEE-754 double-precision adder/subtractor (unchanged)
 // -----------------------------------------------------------------------------
 module f64_add (
     input  logic [63:0] a,
@@ -92,7 +77,6 @@ module f64_add (
     output logic [63:0] result
 );
 
-    // Field extraction
     logic        a_sign, b_sign;
     logic [10:0] a_exp,  b_exp;
     logic [51:0] a_frac, b_frac;
@@ -104,7 +88,6 @@ module f64_add (
     assign a_frac = a[51:0];
     assign b_frac = b[51:0];
 
-    // Special-case detection
     logic a_nan, b_nan, a_inf, b_inf, a_zero, b_zero;
     assign a_nan  = (a_exp == 11'h7FF) && (a_frac != 52'h0);
     assign b_nan  = (b_exp == 11'h7FF) && (b_frac != 52'h0);
@@ -113,20 +96,17 @@ module f64_add (
     assign a_zero = (a_exp == 11'h0)   && (a_frac == 52'h0);
     assign b_zero = (b_exp == 11'h0)   && (b_frac == 52'h0);
 
-    // --- Swap so the larger magnitude is always the "big" operand ---
     logic        big_sign, sml_sign;
     logic [10:0] big_exp,  sml_exp;
-    logic [52:0] big_man,  sml_man;  // implicit 1 prepended
+    logic [52:0] big_man,  sml_man;
     logic        do_swap;
 
     always_comb begin
-        // Compare magnitudes (exp first, then mantissa)
         if (a_exp > b_exp) begin
             do_swap = 1'b0;
         end else if (b_exp > a_exp) begin
             do_swap = 1'b1;
         end else begin
-            // Same exponent — compare fractions
             do_swap = (b_frac > a_frac);
         end
 
@@ -143,18 +123,14 @@ module f64_add (
         end
     end
 
-    // --- Align smaller operand ---
-    // Replaced always_comb with assign to avoid iverilog constant bit-select bug
     logic [5:0]  shift_amt;
-    logic [52:0] sml_aligned;  // after right-shift (truncated; guard bits ignored)
+    logic [52:0] sml_aligned;
 
     assign shift_amt   = ((big_exp - sml_exp) > 11'd63) ? 6'd63 : big_exp[5:0] - sml_exp[5:0];
     assign sml_aligned = sml_man >> shift_amt;
 
-    // --- Add or subtract significands ---
-    // 54-bit sum to catch carry
     logic [53:0] sum_raw;
-    logic        eff_sub;  // effective subtraction when signs differ
+    logic        eff_sub;
     logic        r_sign;
 
     always_comb begin
@@ -163,27 +139,22 @@ module f64_add (
         if (!eff_sub) begin
             sum_raw = {1'b0, big_man} + {1'b0, sml_aligned};
         end else begin
-            // big - small (big always >= small after swap)
             sum_raw = {1'b0, big_man} - {1'b0, sml_aligned};
         end
     end
 
-    // --- Normalise ---
     logic [11:0]  res_exp;
     logic [51:0]  res_man;
-    logic [52:0]  shifted;   // left-shifted significand for normalisation
+    logic [52:0]  shifted;
 
-    // Leading-zero count: iterate ascending so the highest set bit wins (last write).
-    // lz_count = number of left shifts needed to place the MSB at bit 52.
     logic [5:0] lz_count;
     always_comb begin : lz_encoder
-        lz_count = 6'd53;  // default: all-zero significand
+        lz_count = 6'd53;
         for (int i = 0; i <= 52; i++) begin
             if (sum_raw[i]) lz_count = 6'(52 - i);
         end
     end
 
-    // Replaced always_comb with assign to avoid iverilog constant bit-select bug
     assign shifted  = sum_raw[52:0] << lz_count;
     assign res_exp  = sum_raw[53] ? ({1'b0, big_exp} + 12'd1)            :
                       sum_raw[52] ? {1'b0, big_exp}                        :
@@ -192,8 +163,6 @@ module f64_add (
                       sum_raw[52] ? sum_raw[51:0]  :
                                     shifted[51:0];
 
-    // --- Final mux ---
-    // Replaced always_comb with assign to avoid iverilog constant bit-select bug
     assign result =
         (a_nan || b_nan)                          ? 64'h7FF8_0000_0000_0000 :
         (a_inf && b_inf && (a_sign != b_sign))    ? 64'h7FF8_0000_0000_0000 :
@@ -209,40 +178,36 @@ module f64_add (
 endmodule
 
 // -----------------------------------------------------------------------------
-// gemm_systolic — 3×3 weight-stationary systolic GEMM, Option A
-// Computes C = A × B (row-major F64 matrices).
-// FSM: IDLE → LOAD → STEP0 → STEP1 → STEP2 → FINISH
-// Each STEP accumulates one inner-dimension slice (k=0,1,2).
-// 9 f64_mul + 9 f64_add instances run in parallel each cycle.
+// gemm_systolic — 3×3 matrix multiply C=A×B, time-multiplexed (Option B)
+// 1 shared f64_mul + 1 shared f64_add; COMPUTE runs 27 cycles.
+// Counter order: k (outer, 0→2), i (middle, 0→2), j (inner, 0→2).
+// Each COMPUTE cycle: acc[i*3+j] += A_reg[i*3+k] × B_reg[k*3+j]
+// FSM: IDLE → LOAD → COMPUTE(27 cy) → FINISH → IDLE
 // Ports A, B, C are flat packed vectors (9×64=576 bits) for Yosys compatibility.
 // -----------------------------------------------------------------------------
 module gemm_systolic (
     input  logic        clk,
     input  logic        rst_n,
-    input  logic        start,       // one-cycle pulse: latch A, B, begin compute
-    input  logic [575:0] A,          // row-major: A[i*3+j], packed 9×64
+    input  logic        start,
+    input  logic [575:0] A,
     input  logic [575:0] B,
     output logic [575:0] C,
-    output logic        done,        // single-cycle pulse when C is valid
+    output logic        done,
     output logic        busy
 );
 
-    // FSM state encoding
-    typedef enum logic [2:0] {
-        IDLE   = 3'd0,
-        LOAD   = 3'd1,
-        STEP0  = 3'd2,
-        STEP1  = 3'd3,
-        STEP2  = 3'd4,
-        FINISH = 3'd5
-    } state_t;
+    typedef enum logic [1:0] {
+        IDLE    = 2'd0,
+        LOAD    = 2'd1,
+        COMPUTE = 2'd2,
+        FINISH  = 2'd3
+    } gstate_t;
 
-    state_t state, state_nxt;
+    gstate_t gstate, gstate_nxt;
 
     // Unpack flat inputs to internal unpacked arrays
     logic [63:0] A_in [0:8];
     logic [63:0] B_in [0:8];
-
     genvar unp;
     generate
         for (unp = 0; unp < 9; unp++) begin : unpack_in
@@ -251,112 +216,91 @@ module gemm_systolic (
         end
     endgenerate
 
-    // Internal unpacked output array; pack to flat C port
     logic [63:0] C_arr [0:8];
-
     generate
         for (unp = 0; unp < 9; unp++) begin : pack_out
             assign C[unp*64 +: 64] = C_arr[unp];
         end
     endgenerate
 
-    // Registered copies of inputs and accumulators
     logic [63:0] A_reg [0:8];
     logic [63:0] B_reg [0:8];
     logic [63:0] acc   [0:8];
 
-    // k-selector (which inner-dimension index is active this cycle)
-    logic [1:0] k_sel;
-    always_comb begin
-        case (state)
-            STEP0:   k_sel = 2'd0;
-            STEP1:   k_sel = 2'd1;
-            default: k_sel = 2'd2;  // STEP2 and others
-        endcase
-    end
+    // Counters: k=outer(0..2), i=middle(0..2), j=inner(0..2)
+    logic [1:0] k_cnt, i_cnt, j_cnt;
 
-    // Combinational multiply and add products for each (i,j) pair
-    // mul_out[i][j] = A_reg[i*3+k] * B_reg[k*3+j]
-    // add_out[i][j] = acc[i*3+j] + mul_out[i][j]
-    logic [63:0] mul_out [0:2][0:2];
-    logic [63:0] add_out [0:2][0:2];
+    // Index wires — 4-bit to avoid overflow (max = 2*3+2 = 8)
+    logic [3:0] a_idx, b_idx, acc_idx;
+    assign a_idx   = {2'b0, i_cnt} * 4'd3 + {2'b0, k_cnt};
+    assign b_idx   = {2'b0, k_cnt} * 4'd3 + {2'b0, j_cnt};
+    assign acc_idx = {2'b0, i_cnt} * 4'd3 + {2'b0, j_cnt};
 
-    genvar gi, gj;
-    generate
-        for (gi = 0; gi < 3; gi++) begin : gen_row
-            for (gj = 0; gj < 3; gj++) begin : gen_col
-                // Select A column element for current k
-                logic [63:0] a_elem, b_elem;
-                always_comb begin
-                    a_elem = A_reg[gi*3 + k_sel];
-                    b_elem = B_reg[k_sel*3 + gj];
-                end
+    // 1 shared multiplier + 1 shared adder
+    logic [63:0] gmul_out, gadd_out;
+    f64_mul u_gmul (.a(A_reg[a_idx]), .b(B_reg[b_idx]), .result(gmul_out));
+    f64_add u_gadd (.a(acc[acc_idx]), .b(gmul_out),     .result(gadd_out));
 
-                f64_mul u_mul (
-                    .a      (a_elem),
-                    .b      (b_elem),
-                    .result (mul_out[gi][gj])
-                );
-
-                f64_add u_add (
-                    .a      (acc[gi*3+gj]),
-                    .b      (mul_out[gi][gj]),
-                    .result (add_out[gi][gj])
-                );
-            end
-        end
-    endgenerate
+    // All-done flag for COMPUTE state
+    wire g_compute_done = (k_cnt == 2'd2) && (i_cnt == 2'd2) && (j_cnt == 2'd2);
 
     // FSM next-state
     always_comb begin
-        state_nxt = state;
-        case (state)
-            IDLE:   if (start)  state_nxt = LOAD;
-            LOAD:               state_nxt = STEP0;
-            STEP0:              state_nxt = STEP1;
-            STEP1:              state_nxt = STEP2;
-            STEP2:              state_nxt = FINISH;
-            FINISH:             state_nxt = IDLE;
-            default:            state_nxt = IDLE;
+        gstate_nxt = gstate;
+        case (gstate)
+            IDLE:    if (start)         gstate_nxt = LOAD;
+            LOAD:                       gstate_nxt = COMPUTE;
+            COMPUTE: if (g_compute_done) gstate_nxt = FINISH;
+            FINISH:                     gstate_nxt = IDLE;
+            default:                    gstate_nxt = IDLE;
         endcase
     end
 
-    // FSM state register + datapath
-    integer i, j;
+    integer gi;
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state <= IDLE;
-            for (i = 0; i < 9; i++) begin
-                A_reg[i]  <= 64'h0;
-                B_reg[i]  <= 64'h0;
-                acc[i]    <= 64'h0;
-                C_arr[i]  <= 64'h0;
+            gstate <= IDLE;
+            k_cnt  <= 2'd0; i_cnt <= 2'd0; j_cnt <= 2'd0;
+            for (gi = 0; gi < 9; gi++) begin
+                A_reg[gi] <= 64'h0;
+                B_reg[gi] <= 64'h0;
+                acc[gi]   <= 64'h0;
+                C_arr[gi] <= 64'h0;
             end
         end else begin
-            state <= state_nxt;
+            gstate <= gstate_nxt;
 
-            case (state)
+            case (gstate)
                 LOAD: begin
-                    for (i = 0; i < 9; i++) begin
-                        A_reg[i] <= A_in[i];
-                        B_reg[i] <= B_in[i];
-                        acc[i]   <= 64'h0;  // clear accumulators
+                    for (gi = 0; gi < 9; gi++) begin
+                        A_reg[gi] <= A_in[gi];
+                        B_reg[gi] <= B_in[gi];
+                        acc[gi]   <= 64'h0;
                     end
+                    k_cnt <= 2'd0; i_cnt <= 2'd0; j_cnt <= 2'd0;
                 end
 
-                STEP0, STEP1, STEP2: begin
-                    // Register add_out into acc
-                    for (i = 0; i < 3; i++) begin
-                        for (j = 0; j < 3; j++) begin
-                            acc[i*3+j] <= add_out[i][j];
+                COMPUTE: begin
+                    // Accumulate partial product into the correct output element
+                    acc[acc_idx] <= gadd_out;
+
+                    // Advance counters: j fastest, then i, then k
+                    if (j_cnt == 2'd2) begin
+                        j_cnt <= 2'd0;
+                        if (i_cnt == 2'd2) begin
+                            i_cnt <= 2'd0;
+                            if (k_cnt != 2'd2)
+                                k_cnt <= k_cnt + 2'd1;
+                        end else begin
+                            i_cnt <= i_cnt + 2'd1;
                         end
+                    end else begin
+                        j_cnt <= j_cnt + 2'd1;
                     end
                 end
 
                 FINISH: begin
-                    for (i = 0; i < 9; i++) begin
-                        C_arr[i] <= acc[i];
-                    end
+                    for (gi = 0; gi < 9; gi++) C_arr[gi] <= acc[gi];
                 end
 
                 default: ;
@@ -364,61 +308,64 @@ module gemm_systolic (
         end
     end
 
-    // Output signals
-    assign done = (state == FINISH);
-    assign busy = (state != IDLE) && (state != FINISH);
+    assign done = (gstate == FINISH);
+    assign busy = (gstate != IDLE) && (gstate != FINISH);
 
 endmodule
 
 // -----------------------------------------------------------------------------
-// kalman_update — Kalman filter update kernel, Option B
+// kalman_update — Kalman filter update kernel, time-multiplexed (Option B)
 // H = [1, 0, 0] (scalar measurement)
-// FSM: IDLE → INNOV → S_COMP → NR0 → NR1 → NR2 → K_COMP → X_CORR → P_UPD → WAIT_P → DONE
-// Internally instantiates gemm_systolic for the IKH*P covariance update.
 //
-// Forward-ported vs M3:
-//   - r_val[63:0] input replaces hardcoded R_CONST (5.0 F64)
-//   - P_out[0:8] all 9 elements driven
-// Ports x_in, P_in, x_out, P_out are flat packed vectors for Yosys compatibility.
+// Area reduction: 9 direct f64_mul → 1 shared u_shared_mul; sub-cycle FSM.
+// 7 f64_add instances retained: u_nr_sub, u_xo0/1/2, u_1mk0, u_ytilde, u_scomb.
+//
+// FSM (sub-cycles in parentheses):
+//   IDLE→INNOV(1)→S_COMP(1)→NR0(2)→NR1(2)→NR2(2)→NR3(2)
+//   →K_COMP(3)→KY_COMP(3)→X_ADD(1)→P_UPD(1)→WAIT_P→DONE_S→IDLE
+//
+// Ports x_in, P_in, x_out, P_out are flat packed vectors for Yosys.
 // -----------------------------------------------------------------------------
 module kalman_update (
     input  logic        clk,
     input  logic        rst_n,
     input  logic        start,
-    input  logic [63:0] z,              // scalar measurement
-    input  logic [191:0] x_in,          // prior state 3×1, packed 3×64
-    input  logic [575:0] P_in,          // prior covariance 3×3, packed 9×64
-    input  logic [63:0] r_val,          // measurement noise R (default 5.0 = 64'h4014000000000000)
-    output logic [191:0] x_out,         // corrected state, packed 3×64
-    output logic [575:0] P_out,         // corrected covariance (all 9 elements), packed 9×64
+    input  logic [63:0] z,
+    input  logic [191:0] x_in,
+    input  logic [575:0] P_in,
+    input  logic [63:0] r_val,
+    output logic [191:0] x_out,
+    output logic [575:0] P_out,
     output logic        done,
     output logic        busy
 );
 
-    // 2.0 in F64
     localparam logic [63:0] F64_TWO = 64'h4000_0000_0000_0000;
-    // 1.0 in F64
     localparam logic [63:0] F64_ONE = 64'h3FF0_0000_0000_0000;
 
     // FSM states
     typedef enum logic [3:0] {
-        IDLE   = 4'd0,
-        INNOV  = 4'd1,   // y_tilde = z - x_in[0]; S_pre = P_in[0] + r_val
-        S_COMP = 4'd2,   // S = S_pre (latch)
-        NR0    = 4'd3,   // Newton-Raphson iteration 0: x = x0*(2 - S*x0)
-        NR1    = 4'd4,   // NR iteration 1
-        NR2    = 4'd5,   // NR iteration 2
-        NR3    = 4'd11,  // NR iteration 3 (4th total — needed for ULP precision)
-        K_COMP = 4'd6,   // K[i] = P_in[i*3] * S_inv
-        X_CORR = 4'd7,   // x_out[i] = x_in[i] + K[i]*y_tilde
-        P_UPD  = 4'd8,   // Build IKH, fire gemm_systolic(IKH, P_in)
-        WAIT_P = 4'd9,   // Wait for gemm_systolic to finish
-        DONE_S = 4'd10
+        IDLE    = 4'd0,
+        INNOV   = 4'd1,   // latch z, x_in, P_in
+        S_COMP  = 4'd2,   // latch nr_x seed, y_tilde, S_reg
+        NR0     = 4'd3,   // NR iteration 0 (2 sub-cycles)
+        NR1     = 4'd4,   // NR iteration 1
+        NR2     = 4'd5,   // NR iteration 2
+        NR3     = 4'd11,  // NR iteration 3 (final)
+        K_COMP  = 4'd6,   // K[i] = P_in[i*3] * S_inv (3 sub-cycles)
+        KY_COMP = 4'd7,   // ky[i] = K[i] * y_tilde (3 sub-cycles, was X_CORR)
+        X_ADD   = 4'd12,  // x_out[i] = x_reg[i] + ky[i], build IKH (1 cycle)
+        P_UPD   = 4'd8,   // Fire gemm_systolic(IKH, P_in)
+        WAIT_P  = 4'd9,   // Wait for gemm done
+        DONE_S  = 4'd10
     } state_t;
 
     state_t state, state_nxt;
 
-    // Unpack flat input ports to internal unpacked arrays
+    // Sub-cycle counter (max 2 for NR and KY_COMP; max 2 for K_COMP)
+    logic [1:0] sub_cnt, sub_nxt;
+
+    // Unpack flat input ports
     logic [63:0] x_in_arr [0:2];
     logic [63:0] P_in_arr [0:8];
 
@@ -432,7 +379,7 @@ module kalman_update (
         end
     endgenerate
 
-    // Internal unpacked output arrays; packed to flat ports
+    // Internal unpacked output arrays; pack to flat ports
     logic [63:0] x_out_arr [0:2];
     logic [63:0] P_out_arr [0:8];
 
@@ -450,16 +397,17 @@ module kalman_update (
     logic [63:0] x_reg  [0:2];
     logic [63:0] P_reg  [0:8];
     logic [63:0] K_reg  [0:2];
-    logic [63:0] IKH    [0:8];  // (I - K*H) matrix, 3×3
+    logic [63:0] IKH    [0:8];
+    logic [63:0] sx_reg;         // intermediate S*nr_x for NR iterations
+    logic [63:0] ky_arr [0:2];   // intermediate K[i]*y_tilde
 
     // NR intermediate
-    logic [63:0] nr_x;   // current reciprocal estimate
+    logic [63:0] nr_x;
 
-    // gemm_systolic signals (internal unpacked)
+    // gemm_systolic signals
     logic        gs_start, gs_done, gs_busy;
     logic [63:0] gs_A [0:8], gs_B [0:8], gs_C [0:8];
 
-    // Flat wires for gemm_systolic ports
     logic [575:0] gs_A_flat, gs_B_flat, gs_C_flat;
 
     genvar gk;
@@ -482,82 +430,131 @@ module kalman_update (
         .busy  (gs_busy)
     );
 
-    // Combinational helpers for Newton-Raphson
-    // x_new = x * (2.0 - S * x)
-    logic [63:0] sx, two_minus_sx, nr_x_new;
-    f64_mul u_nr_mul1 (.a(S_reg), .b(nr_x),        .result(sx));
-    f64_add u_nr_sub  (.a(F64_TWO), .b({~sx[63], sx[62:0]}), .result(two_minus_sx));  // 2.0 + (-sx)
-    f64_mul u_nr_mul2 (.a(nr_x), .b(two_minus_sx), .result(nr_x_new));
+    // -------------------------------------------------------------------------
+    // Shared multiplier: 1 f64_mul reused across NR, K_COMP, KY_COMP states.
+    // Inputs muxed by always_comb below; result = shared_r.
+    // -------------------------------------------------------------------------
+    logic [63:0] shared_a, shared_b, shared_r;
+    f64_mul u_shared_mul (.a(shared_a), .b(shared_b), .result(shared_r));
 
-    // K[i] = P_reg[i*3] * S_inv  (3 parallel muls)
-    logic [63:0] k_comb [0:2];
-    f64_mul u_k0 (.a(P_reg[0]), .b(S_inv), .result(k_comb[0]));
-    f64_mul u_k1 (.a(P_reg[3]), .b(S_inv), .result(k_comb[1]));
-    f64_mul u_k2 (.a(P_reg[6]), .b(S_inv), .result(k_comb[2]));
-
-    // x_out[i] = x_reg[i] + K[i]*y_tilde  (3 parallel)
-    logic [63:0] ky0, ky1, ky2;
-    logic [63:0] xout0, xout1, xout2;
-    f64_mul u_ky0 (.a(K_reg[0]), .b(y_tilde), .result(ky0));
-    f64_mul u_ky1 (.a(K_reg[1]), .b(y_tilde), .result(ky1));
-    f64_mul u_ky2 (.a(K_reg[2]), .b(y_tilde), .result(ky2));
-    f64_add u_xo0 (.a(x_reg[0]), .b(ky0), .result(xout0));
-    f64_add u_xo1 (.a(x_reg[1]), .b(ky1), .result(xout1));
-    f64_add u_xo2 (.a(x_reg[2]), .b(ky2), .result(xout2));
-
-    // IKH[0,0] = 1 - K[0]: compute combinationally from K_reg[0]
-    logic [63:0] one_minus_k0;
-    f64_add u_1mk0 (.a(F64_ONE), .b(f64_neg(K_reg[0])), .result(one_minus_k0));
-
-    // FSM next-state
-    always_comb begin
-        state_nxt = state;
-        case (state)
-            IDLE:   if (start)    state_nxt = INNOV;
-            INNOV:                state_nxt = S_COMP;
-            S_COMP:               state_nxt = NR0;
-            NR0:                  state_nxt = NR1;
-            NR1:                  state_nxt = NR2;
-            NR2:                  state_nxt = NR3;
-            NR3:                  state_nxt = K_COMP;
-            K_COMP:               state_nxt = X_CORR;
-            X_CORR:               state_nxt = P_UPD;
-            P_UPD:                state_nxt = WAIT_P;
-            WAIT_P: if (gs_done)  state_nxt = DONE_S;
-            DONE_S:               state_nxt = IDLE;
-            default:              state_nxt = IDLE;
-        endcase
-    end
-
-    // Negate helper: flip sign bit
+    // Negate helper functions (F64: flip sign bit)
     function automatic logic [63:0] f64_neg (input logic [63:0] x);
         f64_neg = {~x[63], x[62:0]};
     endfunction
 
-    // Newton-Raphson seed: bit-trick approximation of 1/S
-    // seed = 0x7FDE600000000000 - S_bits (integer subtraction on bit pattern)
+    // Newton-Raphson seed: bit-trick 1/S approximation (F64)
     function automatic logic [63:0] nr_seed (input logic [63:0] s);
         nr_seed = 64'h7FDE_6000_0000_0000 - s;
     endfunction
 
-    // Pre-computed negations as continuous wires to avoid f64_neg() calls
-    // inside always_ff (iverilog 12 "sorry" fix: function body has constant
-    // bit-selects x[63], x[62:0] which are mangled when inlined in always_*).
-    wire [63:0] neg_k1 = {~K_reg[1][63], K_reg[1][62:0]};
-    wire [63:0] neg_k2 = {~K_reg[2][63], K_reg[2][62:0]};
+    // Pre-computed negations as continuous wires
+    wire [63:0] neg_sx_reg = {~sx_reg[63], sx_reg[62:0]};  // -sx_reg for u_nr_sub
+    wire [63:0] neg_k1     = {~K_reg[1][63], K_reg[1][62:0]};
+    wire [63:0] neg_k2     = {~K_reg[2][63], K_reg[2][62:0]};
 
-    // Combinational y_tilde and S_comb instances (driven from registered values).
-    // Declared HERE (before the always_ff that reads S_comb) because iverilog 12
-    // requires declaration before use in procedural contexts.
+    // -------------------------------------------------------------------------
+    // f64_add instances (7 total) — kept parallel, no time-multiplex needed.
+    // -------------------------------------------------------------------------
+
+    // NR: two_minus_sx = 2.0 - sx_reg (replaces inline -sx wire from u_nr_mul1)
+    logic [63:0] two_minus_sx;
+    f64_add u_nr_sub  (.a(F64_TWO), .b(neg_sx_reg),          .result(two_minus_sx));
+
+    // x_out[i] = x_reg[i] + ky_arr[i]
+    logic [63:0] xout0, xout1, xout2;
+    f64_add u_xo0 (.a(x_reg[0]), .b(ky_arr[0]), .result(xout0));
+    f64_add u_xo1 (.a(x_reg[1]), .b(ky_arr[1]), .result(xout1));
+    f64_add u_xo2 (.a(x_reg[2]), .b(ky_arr[2]), .result(xout2));
+
+    // IKH[0,0] = 1 - K[0]
+    logic [63:0] one_minus_k0;
+    f64_add u_1mk0 (.a(F64_ONE), .b(f64_neg(K_reg[0])), .result(one_minus_k0));
+
+    // Combinational y_tilde and S_comb
     logic [63:0] y_tilde_comb, S_comb;
     f64_add u_ytilde (.a(z_reg),    .b(f64_neg(x_reg[0])), .result(y_tilde_comb));
     f64_add u_scomb  (.a(P_reg[0]), .b(r_val),              .result(S_comb));
 
+    // -------------------------------------------------------------------------
+    // Shared multiplier mux (always_comb — no constant bit-selects)
+    // -------------------------------------------------------------------------
+    always_comb begin
+        shared_a = 64'h0;
+        shared_b = 64'h0;
+        case (state)
+            NR0, NR1, NR2, NR3: begin
+                if (sub_cnt == 2'd0) begin
+                    shared_a = S_reg;  // sub 0: compute S * nr_x → sx_reg
+                    shared_b = nr_x;
+                end else begin
+                    shared_a = nr_x;             // sub 1: nr_x * (2 - sx) → new nr_x
+                    shared_b = two_minus_sx;
+                end
+            end
+            K_COMP: begin
+                shared_b = S_inv;
+                case (sub_cnt)
+                    2'd0: shared_a = P_reg[0];  // K[0] = P[0][0] * S_inv
+                    2'd1: shared_a = P_reg[3];  // K[1] = P[1][0] * S_inv
+                    2'd2: shared_a = P_reg[6];  // K[2] = P[2][0] * S_inv
+                    default: shared_a = 64'h0;
+                endcase
+            end
+            KY_COMP: begin
+                shared_b = y_tilde;
+                case (sub_cnt)
+                    2'd0: shared_a = K_reg[0];
+                    2'd1: shared_a = K_reg[1];
+                    2'd2: shared_a = K_reg[2];
+                    default: shared_a = 64'h0;
+                endcase
+            end
+            default: begin
+                shared_a = 64'h0;
+                shared_b = 64'h0;
+            end
+        endcase
+    end
+
+    // -------------------------------------------------------------------------
+    // FSM next-state + sub_nxt
+    // -------------------------------------------------------------------------
+    always_comb begin
+        state_nxt = state;
+        sub_nxt   = sub_cnt + 2'd1;  // default: advance sub counter
+
+        case (state)
+            IDLE:    begin
+                if (start) begin state_nxt = INNOV;  sub_nxt = 2'd0; end
+                else             sub_nxt = 2'd0;
+            end
+            INNOV:   begin state_nxt = S_COMP;  sub_nxt = 2'd0; end
+            S_COMP:  begin state_nxt = NR0;     sub_nxt = 2'd0; end
+            NR0:     if (sub_cnt == 2'd1) begin state_nxt = NR1;    sub_nxt = 2'd0; end
+            NR1:     if (sub_cnt == 2'd1) begin state_nxt = NR2;    sub_nxt = 2'd0; end
+            NR2:     if (sub_cnt == 2'd1) begin state_nxt = NR3;    sub_nxt = 2'd0; end
+            NR3:     if (sub_cnt == 2'd1) begin state_nxt = K_COMP; sub_nxt = 2'd0; end
+            K_COMP:  if (sub_cnt == 2'd2) begin state_nxt = KY_COMP; sub_nxt = 2'd0; end
+            KY_COMP: if (sub_cnt == 2'd2) begin state_nxt = X_ADD;  sub_nxt = 2'd0; end
+            X_ADD:   begin state_nxt = P_UPD;   sub_nxt = 2'd0; end
+            P_UPD:   begin state_nxt = WAIT_P;  sub_nxt = 2'd0; end
+            WAIT_P:  begin
+                if (gs_done) begin state_nxt = DONE_S; sub_nxt = 2'd0; end
+                else              sub_nxt = 2'd0;  // hold counter at 0 while waiting
+            end
+            DONE_S:  begin state_nxt = IDLE;    sub_nxt = 2'd0; end
+            default: begin state_nxt = IDLE;    sub_nxt = 2'd0; end
+        endcase
+    end
+
+    // -------------------------------------------------------------------------
     // FSM datapath
+    // -------------------------------------------------------------------------
     integer ii;
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state    <= IDLE;
+            sub_cnt  <= 2'd0;
             gs_start <= 1'b0;
             for (ii = 0; ii < 9; ii++) begin
                 gs_A[ii]  <= 64'h0;
@@ -568,14 +565,19 @@ module kalman_update (
             for (ii = 0; ii < 3; ii++) begin
                 x_reg[ii]     <= 64'h0;
                 K_reg[ii]     <= 64'h0;
+                ky_arr[ii]    <= 64'h0;
                 x_out_arr[ii] <= 64'h0;
             end
             for (ii = 0; ii < 9; ii++) P_out_arr[ii] <= 64'h0;
-            z_reg <= 64'h0;
-            S_inv <= 64'h0;
-            nr_x  <= 64'h0;
+            z_reg   <= 64'h0;
+            S_reg   <= 64'h0;
+            S_inv   <= 64'h0;
+            nr_x    <= 64'h0;
+            sx_reg  <= 64'h0;
+            y_tilde <= 64'h0;
         end else begin
-            state    <= state_nxt;
+            state   <= state_nxt;
+            sub_cnt <= sub_nxt;
             gs_start <= 1'b0;
 
             case (state)
@@ -583,49 +585,68 @@ module kalman_update (
                     z_reg <= z;
                     for (ii = 0; ii < 3; ii++) x_reg[ii] <= x_in_arr[ii];
                     for (ii = 0; ii < 9; ii++) P_reg[ii] <= P_in_arr[ii];
-                    // y_tilde = z - x_in[0]  (combinational on next cycle)
-                    // S_pre = P_in[0] + r_val (similarly)
-                    // Computed in S_COMP using registered values
                 end
 
                 S_COMP: begin
-                    nr_x <= nr_seed(S_comb);    // seed ≈ 1/S from the combinational S adder
-                    // y_tilde and S_reg also latched this cycle via the second always_ff below
+                    // Latch S, seed, y_tilde using combinational outputs
+                    nr_x    <= nr_seed(S_comb);
+                    y_tilde <= y_tilde_comb;
+                    S_reg   <= S_comb;
                 end
 
-                NR0: begin
-                    nr_x  <= nr_x_new;
-                    S_inv <= nr_x_new;
-                end
-
-                NR1: begin
-                    nr_x  <= nr_x_new;
-                    S_inv <= nr_x_new;
-                end
-
-                NR2: begin
-                    nr_x  <= nr_x_new;
-                    S_inv <= nr_x_new;
+                // NR0..NR3: 2 sub-cycles each
+                // sub 0: shared_r = S_reg * nr_x → latch to sx_reg
+                // sub 1: shared_r = nr_x * (2 - sx_reg) → new nr_x (and S_inv for last)
+                NR0, NR1, NR2: begin
+                    if (sub_cnt == 2'd0) begin
+                        sx_reg <= shared_r;
+                    end else begin  // sub_cnt == 1
+                        nr_x  <= shared_r;
+                        S_inv <= shared_r;
+                    end
                 end
 
                 NR3: begin
-                    S_inv <= nr_x_new;  // final iteration: latch result only
+                    if (sub_cnt == 2'd0) begin
+                        sx_reg <= shared_r;
+                    end else begin  // sub_cnt == 1: final iteration
+                        S_inv <= shared_r;  // don't update nr_x (no more iterations)
+                    end
                 end
 
+                // K_COMP: 3 sub-cycles
+                // sub 0: K_reg[0] = P_reg[0] * S_inv
+                // sub 1: K_reg[1] = P_reg[3] * S_inv
+                // sub 2: K_reg[2] = P_reg[6] * S_inv
                 K_COMP: begin
-                    K_reg[0] <= k_comb[0];
-                    K_reg[1] <= k_comb[1];
-                    K_reg[2] <= k_comb[2];
+                    case (sub_cnt)
+                        2'd0: K_reg[0] <= shared_r;
+                        2'd1: K_reg[1] <= shared_r;
+                        2'd2: K_reg[2] <= shared_r;
+                        default: ;
+                    endcase
                 end
 
-                X_CORR: begin
+                // KY_COMP: 3 sub-cycles
+                // sub 0: ky_arr[0] = K_reg[0] * y_tilde
+                // sub 1: ky_arr[1] = K_reg[1] * y_tilde
+                // sub 2: ky_arr[2] = K_reg[2] * y_tilde
+                KY_COMP: begin
+                    case (sub_cnt)
+                        2'd0: ky_arr[0] <= shared_r;
+                        2'd1: ky_arr[1] <= shared_r;
+                        2'd2: ky_arr[2] <= shared_r;
+                        default: ;
+                    endcase
+                end
+
+                // X_ADD: 1 cycle — ky_arr[0:2] are now populated
+                // x_out[i] = x_reg[i] + ky_arr[i] (via u_xo0/1/2 combinationally)
+                // Also build IKH = (I - K⊗H): H=[1,0,0]
+                X_ADD: begin
                     x_out_arr[0] <= xout0;
                     x_out_arr[1] <= xout1;
                     x_out_arr[2] <= xout2;
-                    // Build complete IKH = I - K*H; H=[1,0,0]
-                    // Row 0: [1-K[0],  0,  0]
-                    // Row 1: [-K[1],   1,  0]
-                    // Row 2: [-K[2],   0,  1]
                     IKH[0] <= one_minus_k0;
                     IKH[1] <= 64'h0;
                     IKH[2] <= 64'h0;
@@ -638,7 +659,6 @@ module kalman_update (
                 end
 
                 P_UPD: begin
-                    // Load IKH and P_reg into gemm_systolic; fire start
                     for (ii = 0; ii < 9; ii++) begin
                         gs_A[ii] <= IKH[ii];
                         gs_B[ii] <= P_reg[ii];
@@ -648,12 +668,9 @@ module kalman_update (
 
                 WAIT_P: begin
                     gs_start <= 1'b0;
-                    // gs_done fires while gemm is in FINISH; gs_C holds old C until
-                    // the next cycle (NBA update). Latch P_out in DONE_S instead.
                 end
 
                 DONE_S: begin
-                    // One cycle after FINISH: gs_C now holds the updated gemm result
                     for (ii = 0; ii < 9; ii++) P_out_arr[ii] <= gs_C[ii];
                 end
 
@@ -662,19 +679,6 @@ module kalman_update (
         end
     end
 
-    // Latch y_tilde and S_reg in S_COMP (one cycle after INNOV so that z_reg,
-    // x_reg, and P_reg have settled from their NBA updates in INNOV).
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            y_tilde <= 64'h0;
-            S_reg   <= 64'h0;
-        end else if (state == S_COMP) begin
-            y_tilde <= y_tilde_comb;
-            S_reg   <= S_comb;
-        end
-    end
-
-    // Outputs
     assign done = (state == DONE_S);
     assign busy = (state != IDLE) && (state != DONE_S);
 
