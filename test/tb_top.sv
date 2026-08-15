@@ -1,46 +1,43 @@
 // =============================================================================
 // tb_top.sv — SPI master BFM testbench for tt_um_joram200
-// All testbench modules combined into a single file.
+// Task 5 Option A: All constants in F32 (stored in lower 32 bits of 64-bit SPI word).
 //
 // Module hierarchy:
 //   spi_master_bfm   — SPI master with named tasks
-//   result_checker   — F64 ULP comparator (4-ULP threshold)
+//   result_checker   — F32 ULP comparator (4-ULP threshold)
 //   program_block    — One Kalman measurement-update scenario
 //   tb_top           — Top-level testbench
 //
 // SPI protocol: CPOL=0, CPHA=0, MSB-first, 8-bit frames.
 // Command byte: [7]=R/W (1=write, 0=read), [6:0]=register index.
-// Data: 8 bytes per 64-bit register, MSB-first. Auto-increment in burst.
+// Data: 8 bytes per register, MSB-first.
+// F32 value occupies lower 32 bits: host sends 4 zero bytes then 4 F32 bytes.
+// DUT returns 4 zero bytes then 4 F32 bytes.
+// burst_buf[i] = {32'h0, f32_value} for all data registers.
 //
 // Register map:
 //   0   CTRL       W    [0]=start, [1]=sw_rst
 //   1   STAT       R    [0]=done,  [1]=busy
-//   2   z          W    measurement F64
+//   2   z          W    measurement F32
 //   3-5  x_in[0:2] W   prior state
 //   6-8  x_out[0:2] R  corrected state
 //   9-17 P_in[0:8] W   prior covariance (row-major)
 //  18-26 P_out[0:8] R  updated covariance
-//  27   R_REG      R/W  measurement noise R (default 5.0)
+//  27   R_REG      R/W  measurement noise R (default 5.0 F32)
 //
 // iverilog 12 compatibility notes:
-//   - No unpacked array subroutine ports (not yet supported by iverilog 12)
-//   - Burst data passed via module-level burst_buf array (hierarchical access)
+//   - No unpacked array subroutine ports
+//   - Burst data passed via module-level burst_buf array
 //   - No variable declarations inside initial blocks
-//   - No localparam with unpacked-array initialisers
 // =============================================================================
 `timescale 1ns/1ps
 
 // -----------------------------------------------------------------------------
 // spi_master_bfm — SPI master bus functional model
-// SCLK period = SPI_CLK_NS (default 80 ns = 12.5 MHz, 4× slower than 50 MHz clk).
-//
-// Burst transfers use the shared burst_buf[] array:
-//   - Before spi_write_burst: caller fills burst_buf[0..n-1]
-//   - After  spi_read_burst : caller reads burst_buf[0..n-1]
-// Maximum burst size = 9 registers (covers the full P matrix).
+// burst_buf[] holds 64-bit SPI words; F32 data is in lower 32 bits.
 // -----------------------------------------------------------------------------
 module spi_master_bfm #(
-    parameter real SPI_CLK_NS = 80.0  // SCLK period in ns
+    parameter real SPI_CLK_NS = 80.0
 )(
     input  logic        clk_sys,
     output logic        sclk,
@@ -48,7 +45,6 @@ module spi_master_bfm #(
     output logic        cs_n,
     input  logic        miso
 );
-    // Shared burst buffer — caller fills/reads this before/after burst tasks
     logic [63:0] burst_buf [0:8];
 
     integer _bb;
@@ -60,9 +56,6 @@ module spi_master_bfm #(
             burst_buf[_bb] = 64'h0;
     end
 
-    // -----------------------------------------------------------------------
-    // spi_xfer_byte — transfer one byte MSB-first, return received byte
-    // -----------------------------------------------------------------------
     task automatic spi_xfer_byte (
         input  logic [7:0] tx,
         output logic [7:0] rx
@@ -79,9 +72,6 @@ module spi_master_bfm #(
         end
     endtask
 
-    // -----------------------------------------------------------------------
-    // spi_write — write a single 64-bit register
-    // -----------------------------------------------------------------------
     task automatic spi_write (
         input logic [6:0]  addr,
         input logic [63:0] data
@@ -98,9 +88,6 @@ module spi_master_bfm #(
         #(SPI_CLK_NS * 2.0);
     endtask
 
-    // -----------------------------------------------------------------------
-    // spi_read — read a single 64-bit register
-    // -----------------------------------------------------------------------
     task automatic spi_read (
         input  logic [6:0]  addr,
         output logic [63:0] data
@@ -120,10 +107,6 @@ module spi_master_bfm #(
         #(SPI_CLK_NS * 2.0);
     endtask
 
-    // -----------------------------------------------------------------------
-    // spi_write_burst — write n contiguous 64-bit registers from burst_buf[]
-    // Caller must fill burst_buf[0..n-1] before calling.
-    // -----------------------------------------------------------------------
     task automatic spi_write_burst (
         input logic [6:0] start_addr,
         input int         n
@@ -142,10 +125,6 @@ module spi_master_bfm #(
         #(SPI_CLK_NS * 2.0);
     endtask
 
-    // -----------------------------------------------------------------------
-    // spi_read_burst — read n contiguous 64-bit registers into burst_buf[]
-    // Caller reads burst_buf[0..n-1] after the task returns.
-    // -----------------------------------------------------------------------
     task automatic spi_read_burst (
         input logic [6:0] start_addr,
         input int         n
@@ -167,9 +146,6 @@ module spi_master_bfm #(
         #(SPI_CLK_NS * 2.0);
     endtask
 
-    // -----------------------------------------------------------------------
-    // poll_done — polls STAT until done is set, with timeout
-    // -----------------------------------------------------------------------
     task automatic poll_done (
         input int timeout_ns
     );
@@ -188,46 +164,49 @@ endmodule
 
 
 // -----------------------------------------------------------------------------
-// result_checker — compare F64 hardware outputs against pre-computed golden ref
-// Checks x_out[0:2] and P_out[0:8]; fails if any exceeds ULP_THRESHOLD.
+// result_checker — compare F32 hardware outputs against pre-computed golden ref
+// F32 values are zero-extended to 64 bits: burst_buf = {32'h0, f32_value}.
+// ULP distance computed on the 64-bit representation; since upper 32 bits are
+// both zero, this equals the F32 ULP distance for positive values.
 //
-// Usage: caller fills hw_x[] and hw_p[], then calls check().
-// iverilog 12 compatible: no unpacked-array subroutine ports; data passed via
-// module-level arrays (hierarchical assignment from tb_top).
+// Scenario: z=1.5, x_in=[0,0,0], P_in=I3, r=5.0 (F32)
+//   S=6.0, K=[1/6,0,0], x_out=[0.25,0,0], P_out=diag(5/6,1,1)
 // -----------------------------------------------------------------------------
 module result_checker #(
     parameter int ULP_THRESHOLD = 4
 )();
-    // Golden reference for z=1.5, x_in=[0,0,0], P_in=I3, r=5.0:
-    //   S=6.0, K=[1/6,0,0], x_out=[0.25,0,0], P_out=diag(5/6,1,1)
+    // Golden reference — F32 bit patterns, zero-extended to 64 bits
     logic [63:0] REF_XOUT [0:2];
     logic [63:0] REF_POUT [0:8];
 
-    // Hardware output arrays filled by tb_top before calling check()
     logic [63:0] hw_x [0:2];
     logic [63:0] hw_p [0:8];
 
     integer _i;
     initial begin
-        REF_XOUT[0] = 64'h3FD0000000000000;  // 0.25
-        REF_XOUT[1] = 64'h0000000000000000;  // 0.0
-        REF_XOUT[2] = 64'h0000000000000000;  // 0.0
+        // x_out[0] = 0.25 in F32 = 0x3E800000
+        REF_XOUT[0] = 64'h000000003E800000;
+        REF_XOUT[1] = 64'h0000000000000000;
+        REF_XOUT[2] = 64'h0000000000000000;
 
-        REF_POUT[0] = 64'h3FEAAAAAAAAAAAAB;  // 5/6 ≈ 0.8333... (round-to-nearest F64)
+        // P_out[0,0] = 5/6 in F32 = 0x3F555555 (nearest even rounding)
+        REF_POUT[0] = 64'h000000003F555555;
         REF_POUT[1] = 64'h0000000000000000;
         REF_POUT[2] = 64'h0000000000000000;
         REF_POUT[3] = 64'h0000000000000000;
-        REF_POUT[4] = 64'h3FF0000000000000;  // 1.0
+        // P_out[1,1] = 1.0 in F32 = 0x3F800000
+        REF_POUT[4] = 64'h000000003F800000;
         REF_POUT[5] = 64'h0000000000000000;
         REF_POUT[6] = 64'h0000000000000000;
         REF_POUT[7] = 64'h0000000000000000;
-        REF_POUT[8] = 64'h3FF0000000000000;  // 1.0
+        // P_out[2,2] = 1.0 in F32 = 0x3F800000
+        REF_POUT[8] = 64'h000000003F800000;
 
         for (_i = 0; _i < 3; _i = _i + 1) hw_x[_i] = 64'h0;
         for (_i = 0; _i < 9; _i = _i + 1) hw_p[_i] = 64'h0;
     end
 
-    // ULP distance (signed-integer reinterpret)
+    // ULP distance (signed-integer reinterpret on 64-bit word)
     function automatic longint unsigned ulp_dist (
         input logic [63:0] a, b
     );
@@ -237,7 +216,6 @@ module result_checker #(
         ulp_dist = (ai > bi) ? longint'(ai - bi) : longint'(bi - ai);
     endfunction
 
-    // check() — compares hw_x[] and hw_p[] against golden reference
     task automatic check ();
         int pass;
         longint unsigned d;
@@ -271,10 +249,9 @@ endmodule
 
 
 // -----------------------------------------------------------------------------
-// program_block — test scenario data
+// program_block — F32 test scenario data
 // Scenario: z=1.5, x_in=[0,0,0], P_in=I3, r=5.0
-// Arrays initialised in initial block (localparam with unpacked-array
-// initialisers not supported by iverilog 12).
+// All values stored as {32'h0, F32_value} in 64-bit burst_buf entries.
 // -----------------------------------------------------------------------------
 module program_block (
     input  logic clk
@@ -285,39 +262,35 @@ module program_block (
 
     integer _i;
     initial begin
-        Z_VAL  = 64'h3FF8000000000000; // 1.5
+        // z = 1.5 in F32 = 0x3FC00000
+        Z_VAL  = 64'h000000003FC00000;
 
         X_IN[0] = 64'h0000000000000000; // 0.0
         X_IN[1] = 64'h0000000000000000;
         X_IN[2] = 64'h0000000000000000;
 
-        // Identity matrix (row-major)
+        // Identity matrix (row-major), F32 1.0 = 0x3F800000
         for (_i = 0; _i < 9; _i = _i + 1) P_IN[_i] = 64'h0;
-        P_IN[0] = 64'h3FF0000000000000; // 1.0 [0,0]
-        P_IN[4] = 64'h3FF0000000000000; // 1.0 [1,1]
-        P_IN[8] = 64'h3FF0000000000000; // 1.0 [2,2]
+        P_IN[0] = 64'h000000003F800000; // 1.0 [0,0]
+        P_IN[4] = 64'h000000003F800000; // 1.0 [1,1]
+        P_IN[8] = 64'h000000003F800000; // 1.0 [2,2]
     end
-    // R_REG default (5.0) is already loaded at reset — no explicit write needed
+    // R_REG default (5.0 F32 = 0x40A00000) is loaded at reset — no explicit write needed
 endmodule
 
 
 // -----------------------------------------------------------------------------
 // tb_top — top-level testbench
-// All signal arrays declared at module level (iverilog 12 does not allow
-// variable declarations inside initial blocks).
 // -----------------------------------------------------------------------------
 module tb_top;
 
-    // Clock and reset
     logic clk, rst_n;
     initial clk = 1'b0;
     always #10 clk = ~clk;  // 50 MHz (20 ns period)
 
-    // DUT signals
     logic [7:0] ui_in, uo_out, uio_in, uio_out, uio_oe;
     logic       ena;
 
-    // SPI signals wired to uio_in/uio_out
     logic sclk_bfm, mosi_bfm, cs_n_bfm, miso_bfm;
     assign uio_in[0] = sclk_bfm;
     assign uio_in[1] = mosi_bfm;
@@ -328,7 +301,6 @@ module tb_top;
     assign ui_in       = 8'h0;
     assign ena         = 1'b1;
 
-    // DUT
     tt_um_joram200 dut (
         .ui_in   (ui_in),
         .uo_out  (uo_out),
@@ -340,7 +312,6 @@ module tb_top;
         .rst_n   (rst_n)
     );
 
-    // SPI master BFM (80 ns SCLK period = 12.5 MHz, 4× slower than 50 MHz sys clk)
     spi_master_bfm #(.SPI_CLK_NS(80.0)) u_bfm (
         .clk_sys (clk),
         .sclk    (sclk_bfm),
@@ -349,75 +320,55 @@ module tb_top;
         .miso    (miso_bfm)
     );
 
-    // Result checker (data passed via u_checker.hw_x / u_checker.hw_p)
     result_checker #(.ULP_THRESHOLD(4)) u_checker ();
-
-    // Program data
     program_block u_prog (.clk(clk));
 
-    // FST dump
     initial begin
         $dumpfile("tb_top.fst");
         $dumpvars(0, tb_top);
     end
 
-    // Test sequence
     initial begin
         integer i;
 
-        // Reset
         rst_n = 1'b0;
         repeat(20) @(posedge clk);
         rst_n = 1'b1;
         repeat(10) @(posedge clk);
 
-        $display("=== SPI Kalman update test ===");
+        $display("=== SPI Kalman update test (F32 Option A) ===");
 
-        // -----------------------------------------------------------------
         // Write z (reg 2) and x_in[0:2] (regs 3-5) in one burst of 4
-        // -----------------------------------------------------------------
         u_bfm.burst_buf[0] = u_prog.Z_VAL;
         u_bfm.burst_buf[1] = u_prog.X_IN[0];
         u_bfm.burst_buf[2] = u_prog.X_IN[1];
         u_bfm.burst_buf[3] = u_prog.X_IN[2];
         u_bfm.spi_write_burst(7'd2, 4);
 
-        // -----------------------------------------------------------------
         // Write P_in[0:8] (regs 9-17) in one burst of 9
-        // -----------------------------------------------------------------
         for (i = 0; i < 9; i = i + 1)
             u_bfm.burst_buf[i] = u_prog.P_IN[i];
         u_bfm.spi_write_burst(7'd9, 9);
 
-        // -----------------------------------------------------------------
         // Fire: write CTRL.start = 1
-        // -----------------------------------------------------------------
         u_bfm.spi_write(7'd0, 64'h0000000000000001);
 
-        // -----------------------------------------------------------------
         // Poll done (500 µs timeout)
-        // -----------------------------------------------------------------
         $display("Waiting for done...");
         u_bfm.poll_done(500000);
         $display("Done asserted.");
 
-        // -----------------------------------------------------------------
-        // Read x_out[0:2] (regs 6-8) into u_bfm.burst_buf then copy out
-        // -----------------------------------------------------------------
+        // Read x_out[0:2] (regs 6-8)
         u_bfm.spi_read_burst(7'd6, 3);
         for (i = 0; i < 3; i = i + 1)
             u_checker.hw_x[i] = u_bfm.burst_buf[i];
 
-        // -----------------------------------------------------------------
         // Read P_out[0:8] (regs 18-26)
-        // -----------------------------------------------------------------
         u_bfm.spi_read_burst(7'd18, 9);
         for (i = 0; i < 9; i = i + 1)
             u_checker.hw_p[i] = u_bfm.burst_buf[i];
 
-        // -----------------------------------------------------------------
         // ULP comparison against golden reference
-        // -----------------------------------------------------------------
         u_checker.check();
 
         $display("=== Test complete ===");
@@ -426,7 +377,7 @@ module tb_top;
 
     // Timeout watchdog
     initial begin
-        #10_000_000;  // 10 ms sim time limit
+        #10_000_000;
         $fatal(1, "WATCHDOG: simulation exceeded 10 ms limit");
     end
 
