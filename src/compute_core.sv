@@ -15,7 +15,7 @@
 
 // -----------------------------------------------------------------------------
 // f64_mul — Combinational IEEE-754 double-precision multiplier
-// Pure always_comb; no clock. Vivado infers DSP48E1 chains for the 53×53 product.
+// Pure assign statements; no clock.
 // Special cases: NaN propagation, Inf×0=NaN, zero handling, overflow→Inf.
 // -----------------------------------------------------------------------------
 module f64_mul (
@@ -56,52 +56,32 @@ module f64_mul (
                      - $signed(13'd1023);
 
     // Normalise: if product[105]=1, shift right 1 and inc exp
+    // Replaced always_comb with assign to avoid iverilog constant bit-select bug
     logic [51:0] norm_man;
-    logic [12:0] norm_exp;
-    always_comb begin
-        if (product[105]) begin
-            norm_man = product[104:53];
-            norm_exp = exp_sum + 13'd1;
-        end else begin
-            norm_man = product[103:52];
-            norm_exp = exp_sum;
-        end
-    end
+    logic signed [12:0] norm_exp;
+    assign norm_man = product[105] ? product[104:53] : product[103:52];
+    assign norm_exp = product[105] ? (exp_sum + 13'd1) : exp_sum;
 
     // Result sign
     assign r_sign = a_sign ^ b_sign;
 
     // Final mux — special cases first
-    always_comb begin
-        if (a_nan || b_nan) begin
-            // Propagate NaN (quiet NaN)
-            result = 64'h7FF8_0000_0000_0000;
-        end else if ((a_inf && b_zero) || (b_inf && a_zero)) begin
-            // Inf × 0 = NaN (IEEE 754)
-            result = 64'h7FF8_0000_0000_0000;
-        end else if (a_inf || b_inf) begin
-            // Inf × finite = ±Inf
-            result = {r_sign, 11'h7FF, 52'h0};
-        end else if (a_zero || b_zero) begin
-            // Zero result
-            result = {r_sign, 63'b0};
-        end else if (norm_exp >= $signed(13'd2047)) begin
-            // Overflow → ±Inf
-            result = {r_sign, 11'h7FF, 52'h0};
-        end else if (norm_exp <= $signed(13'd0)) begin
-            // Underflow → signed zero (denorms not supported)
-            result = {r_sign, 63'b0};
-        end else begin
-            // Normal result
-            result = {r_sign, norm_exp[10:0], norm_man};
-        end
-    end
+    // Replaced always_comb with assign to avoid iverilog constant bit-select bug
+    assign result =
+        (a_nan || b_nan)                              ? 64'h7FF8_0000_0000_0000 :
+        ((a_inf && b_zero) || (b_inf && a_zero))      ? 64'h7FF8_0000_0000_0000 :
+        (a_inf || b_inf)                              ? {r_sign, 11'h7FF, 52'h0} :
+        (a_zero || b_zero)                            ? {r_sign, 63'b0}          :
+        ($signed(norm_exp) >= $signed(13'd2047))      ? {r_sign, 11'h7FF, 52'h0} :
+        ($signed(norm_exp) <= $signed(13'd0))         ? {r_sign, 63'b0}          :
+                                                        {r_sign, norm_exp[10:0], norm_man};
 
 endmodule
 
 // -----------------------------------------------------------------------------
 // f64_add — Combinational IEEE-754 double-precision adder/subtractor
-// Pure always_comb; no clock.
+// Pure assign statements (except for always_comb blocks without constant
+// bit-selects on the RHS); no clock.
 // Algorithm: swap so larger exponent is operand A, align B, add/subtract
 // significands, normalise, round-to-nearest-even.
 // Special cases: NaN propagation, Inf±Inf=NaN, Inf+finite=Inf.
@@ -164,13 +144,12 @@ module f64_add (
     end
 
     // --- Align smaller operand ---
+    // Replaced always_comb with assign to avoid iverilog constant bit-select bug
     logic [5:0]  shift_amt;
     logic [52:0] sml_aligned;  // after right-shift (truncated; guard bits ignored)
 
-    always_comb begin
-        shift_amt = (big_exp - sml_exp > 63) ? 6'd63 : big_exp[5:0] - sml_exp[5:0];
-        sml_aligned = sml_man >> shift_amt;
-    end
+    assign shift_amt   = ((big_exp - sml_exp) > 11'd63) ? 6'd63 : big_exp[5:0] - sml_exp[5:0];
+    assign sml_aligned = sml_man >> shift_amt;
 
     // --- Add or subtract significands ---
     // 54-bit sum to catch carry
@@ -204,52 +183,28 @@ module f64_add (
         end
     end
 
-    always_comb begin
-        shifted = sum_raw[52:0] << lz_count;  // used in else branch below
-        if (sum_raw[53]) begin
-            // Carry out: right-shift 1, increment exponent
-            res_exp = {1'b0, big_exp} + 12'd1;
-            res_man = sum_raw[52:1];
-        end else if (sum_raw[52]) begin
-            // Already normalised
-            res_exp = {1'b0, big_exp};
-            res_man = sum_raw[51:0];
-        end else begin
-            // Left-shift to normalise; exponent decreases by lz_count
-            res_exp = {1'b0, big_exp} - {6'b0, lz_count};
-            res_man = shifted[51:0];
-        end
-    end
+    // Replaced always_comb with assign to avoid iverilog constant bit-select bug
+    assign shifted  = sum_raw[52:0] << lz_count;
+    assign res_exp  = sum_raw[53] ? ({1'b0, big_exp} + 12'd1)            :
+                      sum_raw[52] ? {1'b0, big_exp}                        :
+                                    ({1'b0, big_exp} - {6'b0, lz_count});
+    assign res_man  = sum_raw[53] ? sum_raw[52:1]  :
+                      sum_raw[52] ? sum_raw[51:0]  :
+                                    shifted[51:0];
 
     // --- Final mux ---
-    always_comb begin
-        if (a_nan || b_nan) begin
-            result = 64'h7FF8_0000_0000_0000;
-        end else if (a_inf && b_inf && (a_sign != b_sign)) begin
-            // Inf - Inf = NaN
-            result = 64'h7FF8_0000_0000_0000;
-        end else if (a_inf || b_inf) begin
-            // Return whichever operand is Inf (or a if both)
-            result = a_inf ? a : b;
-        end else if (a_zero && b_zero) begin
-            result = 64'h0000_0000_0000_0000;
-        end else if (a_zero) begin
-            result = b;
-        end else if (b_zero) begin
-            result = a;
-        end else if (sum_raw == 54'h0) begin
-            // Exact cancellation
-            result = 64'h0000_0000_0000_0000;
-        end else if (res_exp[11] || res_exp == 12'h0) begin
-            // Underflow
-            result = {r_sign, 63'b0};
-        end else if (res_exp >= 12'h7FF) begin
-            // Overflow → Inf
-            result = {r_sign, 11'h7FF, 52'h0};
-        end else begin
-            result = {r_sign, res_exp[10:0], res_man};
-        end
-    end
+    // Replaced always_comb with assign to avoid iverilog constant bit-select bug
+    assign result =
+        (a_nan || b_nan)                          ? 64'h7FF8_0000_0000_0000 :
+        (a_inf && b_inf && (a_sign != b_sign))    ? 64'h7FF8_0000_0000_0000 :
+        (a_inf || b_inf)                          ? (a_inf ? a : b)         :
+        (a_zero && b_zero)                        ? 64'h0                   :
+        a_zero                                    ? b                       :
+        b_zero                                    ? a                       :
+        (sum_raw == 54'h0)                        ? 64'h0                   :
+        (res_exp[11] || (res_exp == 12'h0))       ? {r_sign, 63'b0}         :
+        (res_exp >= 12'h7FF)                      ? {r_sign, 11'h7FF, 52'h0}:
+                                                    {r_sign, res_exp[10:0], res_man};
 
 endmodule
 
@@ -259,14 +214,15 @@ endmodule
 // FSM: IDLE → LOAD → STEP0 → STEP1 → STEP2 → FINISH
 // Each STEP accumulates one inner-dimension slice (k=0,1,2).
 // 9 f64_mul + 9 f64_add instances run in parallel each cycle.
+// Ports A, B, C are flat packed vectors (9×64=576 bits) for Yosys compatibility.
 // -----------------------------------------------------------------------------
 module gemm_systolic (
     input  logic        clk,
     input  logic        rst_n,
     input  logic        start,       // one-cycle pulse: latch A, B, begin compute
-    input  logic [63:0] A [0:8],    // row-major: A[i*3+j]
-    input  logic [63:0] B [0:8],
-    output logic [63:0] C [0:8],
+    input  logic [575:0] A,          // row-major: A[i*3+j], packed 9×64
+    input  logic [575:0] B,
+    output logic [575:0] C,
     output logic        done,        // single-cycle pulse when C is valid
     output logic        busy
 );
@@ -282,6 +238,27 @@ module gemm_systolic (
     } state_t;
 
     state_t state, state_nxt;
+
+    // Unpack flat inputs to internal unpacked arrays
+    logic [63:0] A_in [0:8];
+    logic [63:0] B_in [0:8];
+
+    genvar unp;
+    generate
+        for (unp = 0; unp < 9; unp++) begin : unpack_in
+            assign A_in[unp] = A[unp*64 +: 64];
+            assign B_in[unp] = B[unp*64 +: 64];
+        end
+    endgenerate
+
+    // Internal unpacked output array; pack to flat C port
+    logic [63:0] C_arr [0:8];
+
+    generate
+        for (unp = 0; unp < 9; unp++) begin : pack_out
+            assign C[unp*64 +: 64] = C_arr[unp];
+        end
+    endgenerate
 
     // Registered copies of inputs and accumulators
     logic [63:0] A_reg [0:8];
@@ -350,10 +327,10 @@ module gemm_systolic (
         if (!rst_n) begin
             state <= IDLE;
             for (i = 0; i < 9; i++) begin
-                A_reg[i] <= 64'h0;
-                B_reg[i] <= 64'h0;
-                acc[i]   <= 64'h0;
-                C[i]     <= 64'h0;
+                A_reg[i]  <= 64'h0;
+                B_reg[i]  <= 64'h0;
+                acc[i]    <= 64'h0;
+                C_arr[i]  <= 64'h0;
             end
         end else begin
             state <= state_nxt;
@@ -361,8 +338,8 @@ module gemm_systolic (
             case (state)
                 LOAD: begin
                     for (i = 0; i < 9; i++) begin
-                        A_reg[i] <= A[i];
-                        B_reg[i] <= B[i];
+                        A_reg[i] <= A_in[i];
+                        B_reg[i] <= B_in[i];
                         acc[i]   <= 64'h0;  // clear accumulators
                     end
                 end
@@ -378,7 +355,7 @@ module gemm_systolic (
 
                 FINISH: begin
                     for (i = 0; i < 9; i++) begin
-                        C[i] <= acc[i];
+                        C_arr[i] <= acc[i];
                     end
                 end
 
@@ -402,17 +379,18 @@ endmodule
 // Forward-ported vs M3:
 //   - r_val[63:0] input replaces hardcoded R_CONST (5.0 F64)
 //   - P_out[0:8] all 9 elements driven
+// Ports x_in, P_in, x_out, P_out are flat packed vectors for Yosys compatibility.
 // -----------------------------------------------------------------------------
 module kalman_update (
     input  logic        clk,
     input  logic        rst_n,
     input  logic        start,
     input  logic [63:0] z,              // scalar measurement
-    input  logic [63:0] x_in  [0:2],   // prior state 3×1
-    input  logic [63:0] P_in  [0:8],   // prior covariance 3×3
+    input  logic [191:0] x_in,          // prior state 3×1, packed 3×64
+    input  logic [575:0] P_in,          // prior covariance 3×3, packed 9×64
     input  logic [63:0] r_val,          // measurement noise R (default 5.0 = 64'h4014000000000000)
-    output logic [63:0] x_out [0:2],   // corrected state
-    output logic [63:0] P_out [0:8],   // corrected covariance (all 9 elements)
+    output logic [191:0] x_out,         // corrected state, packed 3×64
+    output logic [575:0] P_out,         // corrected covariance (all 9 elements), packed 9×64
     output logic        done,
     output logic        busy
 );
@@ -439,6 +417,33 @@ module kalman_update (
 
     state_t state, state_nxt;
 
+    // Unpack flat input ports to internal unpacked arrays
+    logic [63:0] x_in_arr [0:2];
+    logic [63:0] P_in_arr [0:8];
+
+    genvar ku;
+    generate
+        for (ku = 0; ku < 3; ku++) begin : unpack_xin
+            assign x_in_arr[ku] = x_in[ku*64 +: 64];
+        end
+        for (ku = 0; ku < 9; ku++) begin : unpack_pin
+            assign P_in_arr[ku] = P_in[ku*64 +: 64];
+        end
+    endgenerate
+
+    // Internal unpacked output arrays; packed to flat ports
+    logic [63:0] x_out_arr [0:2];
+    logic [63:0] P_out_arr [0:8];
+
+    generate
+        for (ku = 0; ku < 3; ku++) begin : pack_xout
+            assign x_out[ku*64 +: 64] = x_out_arr[ku];
+        end
+        for (ku = 0; ku < 9; ku++) begin : pack_pout
+            assign P_out[ku*64 +: 64] = P_out_arr[ku];
+        end
+    endgenerate
+
     // Registered intermediate values
     logic [63:0] z_reg, y_tilde, S_reg, S_inv;
     logic [63:0] x_reg  [0:2];
@@ -449,17 +454,29 @@ module kalman_update (
     // NR intermediate
     logic [63:0] nr_x;   // current reciprocal estimate
 
-    // gemm_systolic signals
+    // gemm_systolic signals (internal unpacked)
     logic        gs_start, gs_done, gs_busy;
     logic [63:0] gs_A [0:8], gs_B [0:8], gs_C [0:8];
+
+    // Flat wires for gemm_systolic ports
+    logic [575:0] gs_A_flat, gs_B_flat, gs_C_flat;
+
+    genvar gk;
+    generate
+        for (gk = 0; gk < 9; gk++) begin : gs_flat
+            assign gs_A_flat[gk*64 +: 64] = gs_A[gk];
+            assign gs_B_flat[gk*64 +: 64] = gs_B[gk];
+            assign gs_C[gk] = gs_C_flat[gk*64 +: 64];
+        end
+    endgenerate
 
     gemm_systolic u_gemm (
         .clk   (clk),
         .rst_n (rst_n),
         .start (gs_start),
-        .A     (gs_A),
-        .B     (gs_B),
-        .C     (gs_C),
+        .A     (gs_A_flat),
+        .B     (gs_B_flat),
+        .C     (gs_C_flat),
         .done  (gs_done),
         .busy  (gs_busy)
     );
@@ -534,11 +551,11 @@ module kalman_update (
                 P_reg[ii] <= 64'h0;
             end
             for (ii = 0; ii < 3; ii++) begin
-                x_reg[ii] <= 64'h0;
-                K_reg[ii] <= 64'h0;
-                x_out[ii] <= 64'h0;
+                x_reg[ii]     <= 64'h0;
+                K_reg[ii]     <= 64'h0;
+                x_out_arr[ii] <= 64'h0;
             end
-            for (ii = 0; ii < 9; ii++) P_out[ii] <= 64'h0;
+            for (ii = 0; ii < 9; ii++) P_out_arr[ii] <= 64'h0;
             z_reg <= 64'h0;
             S_inv <= 64'h0;
             nr_x  <= 64'h0;
@@ -549,8 +566,8 @@ module kalman_update (
             case (state)
                 INNOV: begin
                     z_reg <= z;
-                    for (ii = 0; ii < 3; ii++) x_reg[ii] <= x_in[ii];
-                    for (ii = 0; ii < 9; ii++) P_reg[ii] <= P_in[ii];
+                    for (ii = 0; ii < 3; ii++) x_reg[ii] <= x_in_arr[ii];
+                    for (ii = 0; ii < 9; ii++) P_reg[ii] <= P_in_arr[ii];
                     // y_tilde = z - x_in[0]  (combinational on next cycle)
                     // S_pre = P_in[0] + r_val (similarly)
                     // Computed in S_COMP using registered values
@@ -582,9 +599,9 @@ module kalman_update (
                 end
 
                 X_CORR: begin
-                    x_out[0] <= xout0;
-                    x_out[1] <= xout1;
-                    x_out[2] <= xout2;
+                    x_out_arr[0] <= xout0;
+                    x_out_arr[1] <= xout1;
+                    x_out_arr[2] <= xout2;
                     // Build complete IKH = I - K*H; H=[1,0,0]
                     // Row 0: [1-K[0],  0,  0]
                     // Row 1: [-K[1],   1,  0]
@@ -617,7 +634,7 @@ module kalman_update (
 
                 DONE_S: begin
                     // One cycle after FINISH: gs_C now holds the updated gemm result
-                    for (ii = 0; ii < 9; ii++) P_out[ii] <= gs_C[ii];
+                    for (ii = 0; ii < 9; ii++) P_out_arr[ii] <= gs_C[ii];
                 end
 
                 default: ;

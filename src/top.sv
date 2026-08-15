@@ -42,13 +42,13 @@ module tt_um_joram200 (
     logic        core_start, sw_rst_w;
     logic        core_done,  core_busy;
 
-    // Register file wires
-    logic [63:0] z_w;
-    logic [63:0] x_in_w  [0:2];
-    logic [63:0] P_in_w  [0:8];
-    logic [63:0] r_val_w;
-    logic [63:0] x_out_w [0:2];
-    logic [63:0] P_out_w [0:8];
+    // Register file wires — flat packed to match updated port types
+    logic [63:0]  z_w;
+    logic [191:0] x_in_w;   // was logic [63:0] x_in_w [0:2]
+    logic [575:0] P_in_w;   // was logic [63:0] P_in_w [0:8]
+    logic [63:0]  r_val_w;
+    logic [191:0] x_out_w;  // was logic [63:0] x_out_w [0:2]
+    logic [575:0] P_out_w;  // was logic [63:0] P_out_w [0:8]
 
     // SPI slave
     spi_slave u_spi (

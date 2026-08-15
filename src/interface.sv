@@ -51,14 +51,14 @@ module spi_slave (
     output logic        sw_rst,       // level: mirrors CTRL[1]
     // Kalman inputs (written by host)
     output logic [63:0] z_reg,
-    output logic [63:0] x_in_reg [0:2],
-    output logic [63:0] P_in_reg [0:8],
+    output logic [191:0] x_in_reg,
+    output logic [575:0] P_in_reg,
     output logic [63:0] r_val,        // R_REG; reset default = 5.0 F64
     // Kalman status / outputs (read by host)
     input  logic        done,
     input  logic        busy,
-    input  logic [63:0] x_out  [0:2],
-    input  logic [63:0] P_out  [0:8]
+    input  logic [191:0] x_out,
+    input  logic [575:0] P_out
 );
 
     // -------------------------------------------------------------------------
@@ -117,28 +117,74 @@ module spi_slave (
     // Default R value
     localparam logic [63:0] R_DEFAULT = 64'h4014_0000_0000_0000; // 5.0 F64
 
+    // Internal unpacked arrays for x_in and P_in
+    logic [63:0] x_in_arr [0:2];
+    logic [63:0] P_in_arr [0:8];
+
+    // Pack internal arrays to flat output ports
+    assign x_in_reg[63:0]    = x_in_arr[0];
+    assign x_in_reg[127:64]  = x_in_arr[1];
+    assign x_in_reg[191:128] = x_in_arr[2];
+
+    assign P_in_reg[63:0]    = P_in_arr[0];
+    assign P_in_reg[127:64]  = P_in_arr[1];
+    assign P_in_reg[191:128] = P_in_arr[2];
+    assign P_in_reg[255:192] = P_in_arr[3];
+    assign P_in_reg[319:256] = P_in_arr[4];
+    assign P_in_reg[383:320] = P_in_arr[5];
+    assign P_in_reg[447:384] = P_in_arr[6];
+    assign P_in_reg[511:448] = P_in_arr[7];
+    assign P_in_reg[575:512] = P_in_arr[8];
+
+    // Unpack flat input ports to internal arrays for x_out and P_out
+    logic [63:0] x_out_arr [0:2];
+    logic [63:0] P_out_arr [0:8];
+
+    assign x_out_arr[0] = x_out[63:0];
+    assign x_out_arr[1] = x_out[127:64];
+    assign x_out_arr[2] = x_out[191:128];
+
+    assign P_out_arr[0] = P_out[63:0];
+    assign P_out_arr[1] = P_out[127:64];
+    assign P_out_arr[2] = P_out[191:128];
+    assign P_out_arr[3] = P_out[255:192];
+    assign P_out_arr[4] = P_out[319:256];
+    assign P_out_arr[5] = P_out[383:320];
+    assign P_out_arr[6] = P_out[447:384];
+    assign P_out_arr[7] = P_out[511:448];
+    assign P_out_arr[8] = P_out[575:512];
+
     // -------------------------------------------------------------------------
     // Register read function
     // -------------------------------------------------------------------------
     function automatic logic [63:0] reg_read_fn (input logic [6:0] addr);
         case (addr)
             7'd1:  reg_read_fn = {62'b0, busy, done_latch};
-            7'd6:  reg_read_fn = x_out[0];
-            7'd7:  reg_read_fn = x_out[1];
-            7'd8:  reg_read_fn = x_out[2];
-            7'd18: reg_read_fn = P_out[0];
-            7'd19: reg_read_fn = P_out[1];
-            7'd20: reg_read_fn = P_out[2];
-            7'd21: reg_read_fn = P_out[3];
-            7'd22: reg_read_fn = P_out[4];
-            7'd23: reg_read_fn = P_out[5];
-            7'd24: reg_read_fn = P_out[6];
-            7'd25: reg_read_fn = P_out[7];
-            7'd26: reg_read_fn = P_out[8];
+            7'd6:  reg_read_fn = x_out_arr[0];
+            7'd7:  reg_read_fn = x_out_arr[1];
+            7'd8:  reg_read_fn = x_out_arr[2];
+            7'd18: reg_read_fn = P_out_arr[0];
+            7'd19: reg_read_fn = P_out_arr[1];
+            7'd20: reg_read_fn = P_out_arr[2];
+            7'd21: reg_read_fn = P_out_arr[3];
+            7'd22: reg_read_fn = P_out_arr[4];
+            7'd23: reg_read_fn = P_out_arr[5];
+            7'd24: reg_read_fn = P_out_arr[6];
+            7'd25: reg_read_fn = P_out_arr[7];
+            7'd26: reg_read_fn = P_out_arr[8];
             7'd27: reg_read_fn = r_val;
             default: reg_read_fn = 64'h0;
         endcase
     endfunction
+
+    // -------------------------------------------------------------------------
+    // MISO driven continuously from MSB of tx_shift (fix for iverilog constant
+    // bit-select in always_ff).
+    // -------------------------------------------------------------------------
+    assign miso = tx_shift[63];
+
+    // tx_shift left-shift helper: avoids constant bit-select inside always_ff
+    wire [63:0] tx_shift_shifted = {tx_shift[62:0], 1'b0};
 
     // -------------------------------------------------------------------------
     // Main sequential block
@@ -153,23 +199,22 @@ module spi_slave (
             rx_byte    <= 8'h0;
             rx_acc     <= 56'h0;
             tx_shift   <= 64'h0;
-            miso       <= 1'b0;
             done_latch <= 1'b0;
             core_start <= 1'b0;
             sw_rst     <= 1'b0;
             z_reg         <= 64'h0;
-            x_in_reg[0]   <= 64'h0;
-            x_in_reg[1]   <= 64'h0;
-            x_in_reg[2]   <= 64'h0;
-            P_in_reg[0]   <= 64'h0;
-            P_in_reg[1]   <= 64'h0;
-            P_in_reg[2]   <= 64'h0;
-            P_in_reg[3]   <= 64'h0;
-            P_in_reg[4]   <= 64'h0;
-            P_in_reg[5]   <= 64'h0;
-            P_in_reg[6]   <= 64'h0;
-            P_in_reg[7]   <= 64'h0;
-            P_in_reg[8]   <= 64'h0;
+            x_in_arr[0]   <= 64'h0;
+            x_in_arr[1]   <= 64'h0;
+            x_in_arr[2]   <= 64'h0;
+            P_in_arr[0]   <= 64'h0;
+            P_in_arr[1]   <= 64'h0;
+            P_in_arr[2]   <= 64'h0;
+            P_in_arr[3]   <= 64'h0;
+            P_in_arr[4]   <= 64'h0;
+            P_in_arr[5]   <= 64'h0;
+            P_in_arr[6]   <= 64'h0;
+            P_in_arr[7]   <= 64'h0;
+            P_in_arr[8]   <= 64'h0;
             r_val         <= R_DEFAULT;
         end else begin
             // One-cycle pulse default
@@ -246,20 +291,20 @@ module spi_slave (
                                             core_start <= mosi_r;
                                             sw_rst     <= rx_byte[0];
                                         end
-                                        7'd2:  z_reg       <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd3:  x_in_reg[0] <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd4:  x_in_reg[1] <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd5:  x_in_reg[2] <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd9:  P_in_reg[0] <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd10: P_in_reg[1] <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd11: P_in_reg[2] <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd12: P_in_reg[3] <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd13: P_in_reg[4] <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd14: P_in_reg[5] <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd15: P_in_reg[6] <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd16: P_in_reg[7] <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd17: P_in_reg[8] <= {rx_acc, rx_byte[6:0], mosi_r};
-                                        7'd27: r_val       <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd2:  z_reg         <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd3:  x_in_arr[0]   <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd4:  x_in_arr[1]   <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd5:  x_in_arr[2]   <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd9:  P_in_arr[0]   <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd10: P_in_arr[1]   <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd11: P_in_arr[2]   <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd12: P_in_arr[3]   <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd13: P_in_arr[4]   <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd14: P_in_arr[5]   <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd15: P_in_arr[6]   <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd16: P_in_arr[7]   <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd17: P_in_arr[8]   <= {rx_acc, rx_byte[6:0], mosi_r};
+                                        7'd27: r_val         <= {rx_acc, rx_byte[6:0], mosi_r};
                                         default: ;
                                     endcase
                                 end
@@ -285,10 +330,10 @@ module spi_slave (
                 endcase
             end
 
-            // SCLK falling edge: drive MISO from tx_shift (CPHA=0 convention)
+            // SCLK falling edge: shift tx_shift left (CPHA=0 convention)
+            // miso is driven continuously from tx_shift[63] via assign above
             if (sclk_fall && cs_active) begin
-                miso     <= tx_shift[63];
-                tx_shift <= {tx_shift[62:0], 1'b0};
+                tx_shift <= tx_shift_shifted;
             end
         end
     end
