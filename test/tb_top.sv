@@ -209,19 +209,19 @@ module result_checker #(
 
     integer _i;
     initial begin
-        REF_XOUT[0] = 64'h3FD0000000000000;  // 0.25
+        REF_XOUT[0] = 64'h0040000000000000;  // 0.25 in Q8.56
         REF_XOUT[1] = 64'h0000000000000000;  // 0.0
         REF_XOUT[2] = 64'h0000000000000000;  // 0.0
 
-        REF_POUT[0] = 64'h3FEAAAAAAAAAAAAB;  // 5/6 ≈ 0.8333... (round-to-nearest F64)
+        REF_POUT[0] = 64'h00D5555555555555;  // 5/6 ≈ 0.8333... (round-to-nearest Q8.56)
         REF_POUT[1] = 64'h0000000000000000;
         REF_POUT[2] = 64'h0000000000000000;
         REF_POUT[3] = 64'h0000000000000000;
-        REF_POUT[4] = 64'h3FF0000000000000;  // 1.0
+        REF_POUT[4] = 64'h0100000000000000;  // 1.0 in Q8.56
         REF_POUT[5] = 64'h0000000000000000;
         REF_POUT[6] = 64'h0000000000000000;
         REF_POUT[7] = 64'h0000000000000000;
-        REF_POUT[8] = 64'h3FF0000000000000;  // 1.0
+        REF_POUT[8] = 64'h0100000000000000;  // 1.0 in Q8.56
 
         for (_i = 0; _i < 3; _i = _i + 1) hw_x[_i] = 64'h0;
         for (_i = 0; _i < 9; _i = _i + 1) hw_p[_i] = 64'h0;
@@ -285,17 +285,17 @@ module program_block (
 
     integer _i;
     initial begin
-        Z_VAL  = 64'h3FF8000000000000; // 1.5
+        Z_VAL  = 64'h0180000000000000; // 1.5 in Q8.56
 
         X_IN[0] = 64'h0000000000000000; // 0.0
         X_IN[1] = 64'h0000000000000000;
         X_IN[2] = 64'h0000000000000000;
 
-        // Identity matrix (row-major)
+        // Identity matrix (row-major, Q8.56 1.0)
         for (_i = 0; _i < 9; _i = _i + 1) P_IN[_i] = 64'h0;
-        P_IN[0] = 64'h3FF0000000000000; // 1.0 [0,0]
-        P_IN[4] = 64'h3FF0000000000000; // 1.0 [1,1]
-        P_IN[8] = 64'h3FF0000000000000; // 1.0 [2,2]
+        P_IN[0] = 64'h0100000000000000; // 1.0 Q8.56 [0,0]
+        P_IN[4] = 64'h0100000000000000; // 1.0 Q8.56 [1,1]
+        P_IN[8] = 64'h0100000000000000; // 1.0 Q8.56 [2,2]
     end
     // R_REG default (5.0) is already loaded at reset — no explicit write needed
 endmodule

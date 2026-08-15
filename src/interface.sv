@@ -115,7 +115,7 @@ module spi_slave (
     logic done_latch;
 
     // Default R value
-    localparam logic [63:0] R_DEFAULT = 64'h4014_0000_0000_0000; // 5.0 F64
+    localparam logic [63:0] R_DEFAULT = 64'h0500_0000_0000_0000; // 5.0 Q8.56
 
     // Internal unpacked arrays for x_in and P_in
     logic [63:0] x_in_arr [0:2];
