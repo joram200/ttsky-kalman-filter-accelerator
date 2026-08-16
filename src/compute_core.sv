@@ -1,7 +1,7 @@
 `timescale 1ns/1ps
 // =============================================================================
 // compute_core.sv — F32 + Time-multiplexed compute core for tt_um_joram200
-// Task 6 (iteration 5): Rank-1 P update + NR 4→3 + sequential f32_add_seq
+// Task 6 (iteration 5+6): Rank-1 P update + NR 4→3 + f32_add_seq + state retention
 //
 // vs iter4 (bit-serial f32_mul_seq):
 //   - GEMM_INIT + GEMM_COMPUTE (27-MAC) replaced by P_UPDATE (9-MAC rank-1)
@@ -21,6 +21,12 @@
 //   kalman_update — FSM with rank-1 P_UPDATE replacing GEMM
 //
 // FSM states: IDLE→S_COMP→NR0→NR1→NR2→K_COMP→KY_COMP→X_ADD→P_UPDATE→DONE_S
+//
+// iter6 adds state retention: x_reg[3] + p_reg[9] stored on-chip.
+//   DONE_S captures x_out_arr→x_reg, acc→p_reg (for next update).
+//   Write-event ports (x_wr_en/idx/val, p_wr_en/idx/val) allow the SPI
+//   interface to initialise x_reg and p_reg before the first update.
+//   x_in and P_in input ports are removed; core reads from x_reg and p_reg.
 // =============================================================================
 
 // -----------------------------------------------------------------------------
@@ -339,8 +345,13 @@ module kalman_update (
     input  logic        rst_n,
     input  logic        start,
     input  logic [31:0]  z,
-    input  logic [95:0]  x_in,
-    input  logic [287:0] P_in,
+    // Write-event ports: SPI interface writes x and P before each update
+    input  logic        x_wr_en,
+    input  logic [1:0]  x_wr_idx,   // 0..2
+    input  logic [31:0] x_wr_val,
+    input  logic        p_wr_en,
+    input  logic [3:0]  p_wr_idx,   // 0..8
+    input  logic [31:0] p_wr_val,
     input  logic [31:0]  r_val,
     output logic [95:0]  x_out,
     output logic [287:0] P_out,
@@ -367,25 +378,18 @@ module kalman_update (
     logic [1:0] sub_cnt, sub_nxt;
 
     // -------------------------------------------------------------------------
-    // Unpack flat input ports
+    // On-chip state registers (retain x and P across updates)
+    // Written by write-event ports from the SPI interface, and captured
+    // from x_out_arr / acc at DONE_S.
     // -------------------------------------------------------------------------
-    logic [31:0] x_in_arr [0:2];
-    logic [31:0] P_in_arr [0:8];
-
-    genvar ku;
-    generate
-        for (ku = 0; ku < 3; ku++) begin : unpack_xin
-            assign x_in_arr[ku] = x_in[ku*32 +: 32];
-        end
-        for (ku = 0; ku < 9; ku++) begin : unpack_pin
-            assign P_in_arr[ku] = P_in[ku*32 +: 32];
-        end
-    endgenerate
+    logic [31:0] x_reg [0:2];
+    logic [31:0] p_reg [0:8];
 
     // -------------------------------------------------------------------------
     // Output packing
     // -------------------------------------------------------------------------
     logic [31:0] x_out_arr [0:2];
+    genvar ku;
     generate
         for (ku = 0; ku < 3; ku++) begin : pack_xout
             assign x_out[ku*32 +: 32] = x_out_arr[ku];
@@ -417,20 +421,20 @@ module kalman_update (
     assign pu_last = (i_cnt == 2'd2) && (j_cnt == 2'd2);
 
     // -------------------------------------------------------------------------
-    // 9-to-1 mux: P_in_arr[i*3+j]  (add_a in P_UPDATE)
+    // 9-to-1 mux: p_reg[i*3+j]  (add_a in P_UPDATE)
     // -------------------------------------------------------------------------
     logic [31:0] p_in_elem;
     always_comb begin
         case ({i_cnt, j_cnt})
-            4'b0000: p_in_elem = P_in_arr[0];
-            4'b0001: p_in_elem = P_in_arr[1];
-            4'b0010: p_in_elem = P_in_arr[2];
-            4'b0100: p_in_elem = P_in_arr[3];
-            4'b0101: p_in_elem = P_in_arr[4];
-            4'b0110: p_in_elem = P_in_arr[5];
-            4'b1000: p_in_elem = P_in_arr[6];
-            4'b1001: p_in_elem = P_in_arr[7];
-            4'b1010: p_in_elem = P_in_arr[8];
+            4'b0000: p_in_elem = p_reg[0];
+            4'b0001: p_in_elem = p_reg[1];
+            4'b0010: p_in_elem = p_reg[2];
+            4'b0100: p_in_elem = p_reg[3];
+            4'b0101: p_in_elem = p_reg[4];
+            4'b0110: p_in_elem = p_reg[5];
+            4'b1000: p_in_elem = p_reg[6];
+            4'b1001: p_in_elem = p_reg[7];
+            4'b1010: p_in_elem = p_reg[8];
             default: p_in_elem = 32'h0;
         endcase
     end
@@ -525,9 +529,9 @@ module kalman_update (
             K_COMP: begin
                 mul_b = S_inv;
                 case (sub_cnt)
-                    2'd0: mul_a = P_in_arr[0];
-                    2'd1: mul_a = P_in_arr[3];
-                    2'd2: mul_a = P_in_arr[6];
+                    2'd0: mul_a = p_reg[0];
+                    2'd1: mul_a = p_reg[3];
+                    2'd2: mul_a = p_reg[6];
                     default: mul_a = 32'h0;
                 endcase
             end
@@ -541,7 +545,7 @@ module kalman_update (
                 endcase
             end
             P_UPDATE: begin
-                // K_reg[i] * P_in_arr[j]  (first row of P)
+                // K_reg[i] * p_reg[j]  (first row of P)
                 case (i_cnt)
                     2'd0: mul_a = K_reg[0];
                     2'd1: mul_a = K_reg[1];
@@ -549,9 +553,9 @@ module kalman_update (
                     default: mul_a = 32'h0;
                 endcase
                 case (j_cnt)
-                    2'd0: mul_b = P_in_arr[0];
-                    2'd1: mul_b = P_in_arr[1];
-                    2'd2: mul_b = P_in_arr[2];
+                    2'd0: mul_b = p_reg[0];
+                    2'd1: mul_b = p_reg[1];
+                    2'd2: mul_b = p_reg[2];
                     default: mul_b = 32'h0;
                 endcase
             end
@@ -569,9 +573,9 @@ module kalman_update (
             S_COMP: begin
                 if (sub_cnt == 2'd0) begin
                     add_a = z;
-                    add_b = {~x_in_arr[0][31], x_in_arr[0][30:0]};  // z - x[0]
+                    add_b = {~x_reg[0][31], x_reg[0][30:0]};  // z - x[0]
                 end else begin
-                    add_a = P_in_arr[0];
+                    add_a = p_reg[0];
                     add_b = r_val;  // S = P[0,0] + R
                 end
             end
@@ -582,9 +586,9 @@ module kalman_update (
             end
             X_ADD: begin
                 case (sub_cnt)
-                    2'd0: begin add_a = x_in_arr[0]; add_b = ky_arr[0]; end
-                    2'd1: begin add_a = x_in_arr[1]; add_b = ky_arr[1]; end
-                    2'd2: begin add_a = x_in_arr[2]; add_b = ky_arr[2]; end
+                    2'd0: begin add_a = x_reg[0]; add_b = ky_arr[0]; end
+                    2'd1: begin add_a = x_reg[1]; add_b = ky_arr[1]; end
+                    2'd2: begin add_a = x_reg[2]; add_b = ky_arr[2]; end
                     default: ;
                 endcase
             end
@@ -691,10 +695,37 @@ module kalman_update (
                 K_reg[ii]     <= 32'h0;
                 ky_arr[ii]    <= 32'h0;
                 x_out_arr[ii] <= 32'h0;
+                x_reg[ii]     <= 32'h0;
             end
             i_cnt <= 2'd0; j_cnt <= 2'd0;
-            for (ii = 0; ii < 9; ii++) acc[ii] <= 32'h0;
+            for (ii = 0; ii < 9; ii++) begin
+                acc[ii]   <= 32'h0;
+                p_reg[ii] <= 32'h0;
+            end
         end else begin
+            // Write-event: SPI interface writes x or P into on-chip registers
+            if (x_wr_en) begin
+                case (x_wr_idx)
+                    2'd0: x_reg[0] <= x_wr_val;
+                    2'd1: x_reg[1] <= x_wr_val;
+                    2'd2: x_reg[2] <= x_wr_val;
+                    default: ;
+                endcase
+            end
+            if (p_wr_en) begin
+                case (p_wr_idx)
+                    4'd0: p_reg[0] <= p_wr_val;
+                    4'd1: p_reg[1] <= p_wr_val;
+                    4'd2: p_reg[2] <= p_wr_val;
+                    4'd3: p_reg[3] <= p_wr_val;
+                    4'd4: p_reg[4] <= p_wr_val;
+                    4'd5: p_reg[5] <= p_wr_val;
+                    4'd6: p_reg[6] <= p_wr_val;
+                    4'd7: p_reg[7] <= p_wr_val;
+                    4'd8: p_reg[8] <= p_wr_val;
+                    default: ;
+                endcase
+            end
             state   <= state_nxt;
             sub_cnt <= sub_nxt;
 
@@ -805,7 +836,11 @@ module kalman_update (
                     end
                 end
 
-                DONE_S: ;
+                // DONE_S: capture outputs into on-chip state registers for next update
+                DONE_S: begin
+                    for (ii = 0; ii < 3; ii++) x_reg[ii] <= x_out_arr[ii];
+                    for (ii = 0; ii < 9; ii++) p_reg[ii] <= acc[ii];
+                end
                 default: ;
             endcase
         end
