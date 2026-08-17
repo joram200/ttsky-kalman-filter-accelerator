@@ -1,6 +1,6 @@
 `timescale 1ns/1ps
 // =============================================================================
-// compute_core.sv — INT16 Q8.8 fixed-point Kalman filter accelerator
+// compute_core.sv — INT16 Q8.8 fixed-point Kalman filter accelerator (2D state)
 //
 // Q8.8 format: value_real = register_value / 256  (signed 16-bit integer)
 //   Multiply: (a_Q88 × b_Q88) >> 8  → Q8.8 result
@@ -9,9 +9,10 @@
 // Modules:
 //   int16_mul_seq  — 17-cycle signed 16×16→16 shift-and-add (Baugh-Wooley)
 //   int16_div      — 17-cycle restoring divider: floor(65536 / S_Q88)
-//   kalman_update  — FSM; rank-1 P update; 1 shared multiplier + 1 divider
+//   kalman_update  — FSM; 2D state; rank-1 P update; 1 shared multiplier + 1 divider
 //
 // FSM states: IDLE → S_COMP → DIV → K_COMP → KY_COMP → X_ADD → P_UPDATE → DONE_S
+// State: x ∈ ℝ², P ∈ ℝ²ˣ² (row-major), H=[1,0]
 // =============================================================================
 
 // -----------------------------------------------------------------------------
@@ -161,9 +162,10 @@ module int16_div (
 endmodule
 
 // -----------------------------------------------------------------------------
-// kalman_update — INT16 Q8.8 Kalman filter update (H=[1,0,0], rank-1 P update)
+// kalman_update — INT16 Q8.8 Kalman filter update (2D state, H=[1,0])
 //
-//   P_new[i,j] = P[i,j] − K[i] × P[0,j]    i,j ∈ {0,1,2}
+//   K[i]        = P[i,0] / S                  i ∈ {0,1}
+//   P_new[i,j]  = P[i,j] − K[i] × P[0,j]     i,j ∈ {0,1}
 //
 // Arithmetic: 1 shared int16_mul_seq + 1 int16_div.
 // Add/subtract operations are combinational (1 cycle).
@@ -171,17 +173,17 @@ endmodule
 // FSM: IDLE → S_COMP → DIV → K_COMP → KY_COMP → X_ADD → P_UPDATE → DONE_S
 // -----------------------------------------------------------------------------
 module kalman_update (
-    input  logic         clk,
-    input  logic         rst_n,
-    input  logic         start,
-    input  logic [15:0]  z,
-    input  logic [47:0]  x_in,    // 3×16
-    input  logic [143:0] P_in,    // 9×16
-    input  logic [15:0]  r_val,
-    output logic [47:0]  x_out,   // 3×16
-    output logic [143:0] P_out,   // 9×16
-    output logic         done,
-    output logic         busy
+    input  logic        clk,
+    input  logic        rst_n,
+    input  logic        start,
+    input  logic [15:0] z,
+    input  logic [31:0] x_in,    // 2×16
+    input  logic [63:0] P_in,    // 4×16 (2×2 row-major)
+    input  logic [15:0] r_val,
+    output logic [31:0] x_out,   // 2×16
+    output logic [63:0] P_out,   // 4×16 (2×2 row-major)
+    output logic        done,
+    output logic        busy
 );
     typedef enum logic [2:0] {
         IDLE     = 3'd0,
@@ -200,14 +202,14 @@ module kalman_update (
     // -------------------------------------------------------------------------
     // Unpack flat inputs
     // -------------------------------------------------------------------------
-    logic [15:0] x_in_arr [0:2];
-    logic [15:0] p_in_arr [0:8];
+    logic [15:0] x_in_arr [0:1];
+    logic [15:0] p_in_arr [0:3];
     genvar ki;
     generate
-        for (ki = 0; ki < 3; ki++) begin : g_unpack_x
+        for (ki = 0; ki < 2; ki++) begin : g_unpack_x
             assign x_in_arr[ki] = x_in[ki*16 +: 16];
         end
-        for (ki = 0; ki < 9; ki++) begin : g_unpack_p
+        for (ki = 0; ki < 4; ki++) begin : g_unpack_p
             assign p_in_arr[ki] = P_in[ki*16 +: 16];
         end
     endgenerate
@@ -215,13 +217,13 @@ module kalman_update (
     // -------------------------------------------------------------------------
     // Pack outputs
     // -------------------------------------------------------------------------
-    logic [15:0] x_out_arr [0:2];
-    logic [15:0] acc [0:8];
+    logic [15:0] x_out_arr [0:1];
+    logic [15:0] acc [0:3];
     generate
-        for (ki = 0; ki < 3; ki++) begin : g_pack_x
+        for (ki = 0; ki < 2; ki++) begin : g_pack_x
             assign x_out[ki*16 +: 16] = x_out_arr[ki];
         end
-        for (ki = 0; ki < 9; ki++) begin : g_pack_p
+        for (ki = 0; ki < 4; ki++) begin : g_pack_p
             assign P_out[ki*16 +: 16] = acc[ki];
         end
     endgenerate
@@ -232,13 +234,13 @@ module kalman_update (
     logic [15:0] y_tilde;
     logic [15:0] S_reg;
     logic [15:0] S_inv;
-    logic [15:0] K_reg [0:2];
-    logic [15:0] ky_arr [0:2];
+    logic [15:0] K_reg [0:1];
+    logic [15:0] ky_arr [0:1];
 
     // P_UPDATE counters
     logic [1:0] i_cnt, j_cnt;
     logic       pu_last;
-    assign pu_last = (i_cnt == 2'd2) && (j_cnt == 2'd2);
+    assign pu_last = (i_cnt == 2'd1) && (j_cnt == 2'd1);
 
     // -------------------------------------------------------------------------
     // Shared multiplier + divider
@@ -284,10 +286,10 @@ module kalman_update (
         case (state)
             K_COMP: begin
                 mul_b = S_inv;
+                // K[i] = P[i,0] * S_inv; P[i,0] = p_in_arr[i*2+0]
                 case (sub_cnt)
-                    2'd0: mul_a = p_in_arr[0];
-                    2'd1: mul_a = p_in_arr[3];
-                    2'd2: mul_a = p_in_arr[6];
+                    2'd0: mul_a = p_in_arr[0];   // P[0,0]
+                    2'd1: mul_a = p_in_arr[2];   // P[1,0]
                     default: mul_a = 16'h0;
                 endcase
             end
@@ -296,21 +298,19 @@ module kalman_update (
                 case (sub_cnt)
                     2'd0: mul_a = K_reg[0];
                     2'd1: mul_a = K_reg[1];
-                    2'd2: mul_a = K_reg[2];
                     default: mul_a = 16'h0;
                 endcase
             end
             P_UPDATE: begin
+                // K[i]*P[0,j]: mul_a = K[i], mul_b = P[0,j] = p_in_arr[j]
                 case (i_cnt)
                     2'd0: mul_a = K_reg[0];
                     2'd1: mul_a = K_reg[1];
-                    2'd2: mul_a = K_reg[2];
                     default: mul_a = 16'h0;
                 endcase
                 case (j_cnt)
-                    2'd0: mul_b = p_in_arr[0];
-                    2'd1: mul_b = p_in_arr[1];
-                    2'd2: mul_b = p_in_arr[2];
+                    2'd0: mul_b = p_in_arr[0];   // P[0,0]
+                    2'd1: mul_b = p_in_arr[1];   // P[0,1]
                     default: mul_b = 16'h0;
                 endcase
             end
@@ -342,12 +342,12 @@ module kalman_update (
 
             K_COMP: begin
                 if (!mul_done_w) sub_nxt = sub_cnt;
-                else if (sub_cnt == 2'd2) begin state_nxt = KY_COMP; sub_nxt = 2'd0; end
+                else if (sub_cnt == 2'd1) begin state_nxt = KY_COMP; sub_nxt = 2'd0; end
             end
 
             KY_COMP: begin
                 if (!mul_done_w) sub_nxt = sub_cnt;
-                else if (sub_cnt == 2'd2) begin state_nxt = X_ADD; sub_nxt = 2'd0; end
+                else if (sub_cnt == 2'd1) begin state_nxt = X_ADD; sub_nxt = 2'd0; end
             end
 
             X_ADD: begin
@@ -374,13 +374,13 @@ module kalman_update (
             state <= IDLE; sub_cnt <= 2'd0;
             mul_active <= 1'b0; div_active <= 1'b0;
             y_tilde <= 16'h0; S_reg <= 16'h0; S_inv <= 16'h0;
-            for (ii = 0; ii < 3; ii++) begin
+            for (ii = 0; ii < 2; ii++) begin
                 K_reg[ii]     <= 16'h0;
                 ky_arr[ii]    <= 16'h0;
                 x_out_arr[ii] <= 16'h0;
             end
             i_cnt <= 2'd0; j_cnt <= 2'd0;
-            for (ii = 0; ii < 9; ii++) acc[ii] <= 16'h0;
+            for (ii = 0; ii < 4; ii++) acc[ii] <= 16'h0;
         end else begin
             state   <= state_nxt;
             sub_cnt <= sub_nxt;
@@ -407,7 +407,6 @@ module kalman_update (
                         case (sub_cnt)
                             2'd0: K_reg[0] <= mul_result;
                             2'd1: K_reg[1] <= mul_result;
-                            2'd2: K_reg[2] <= mul_result;
                             default: ;
                         endcase
                     end
@@ -418,7 +417,6 @@ module kalman_update (
                         case (sub_cnt)
                             2'd0: ky_arr[0] <= mul_result;
                             2'd1: ky_arr[1] <= mul_result;
-                            2'd2: ky_arr[2] <= mul_result;
                             default: ;
                         endcase
                     end
@@ -427,28 +425,22 @@ module kalman_update (
                 X_ADD: begin
                     x_out_arr[0] <= x_in_arr[0] + ky_arr[0];
                     x_out_arr[1] <= x_in_arr[1] + ky_arr[1];
-                    x_out_arr[2] <= x_in_arr[2] + ky_arr[2];
                     i_cnt <= 2'd0; j_cnt <= 2'd0;
                 end
 
-                // Rank-1 P update: acc[i*3+j] = P[i,j] − K[i]×P[0,j]
+                // Rank-1 P update: acc[i*2+j] = P[i,j] − K[i]×P[0,j]
                 // mul computes K[i]*P[0,j]; subtract is combinational on done
                 P_UPDATE: begin
                     if (mul_done_w) begin
                         case ({i_cnt, j_cnt})
                             4'b0000: acc[0] <= p_in_arr[0] - mul_result;
                             4'b0001: acc[1] <= p_in_arr[1] - mul_result;
-                            4'b0010: acc[2] <= p_in_arr[2] - mul_result;
-                            4'b0100: acc[3] <= p_in_arr[3] - mul_result;
-                            4'b0101: acc[4] <= p_in_arr[4] - mul_result;
-                            4'b0110: acc[5] <= p_in_arr[5] - mul_result;
-                            4'b1000: acc[6] <= p_in_arr[6] - mul_result;
-                            4'b1001: acc[7] <= p_in_arr[7] - mul_result;
-                            4'b1010: acc[8] <= p_in_arr[8] - mul_result;
+                            4'b0100: acc[2] <= p_in_arr[2] - mul_result;
+                            4'b0101: acc[3] <= p_in_arr[3] - mul_result;
                             default: ;
                         endcase
                         if (!pu_last) begin
-                            if (j_cnt == 2'd2) begin
+                            if (j_cnt == 2'd1) begin
                                 j_cnt <= 2'd0;
                                 i_cnt <= i_cnt + 2'd1;
                             end else begin
