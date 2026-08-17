@@ -164,18 +164,18 @@ endmodule
 
 
 // -----------------------------------------------------------------------------
-// result_checker — compare F32 hardware outputs against pre-computed golden ref
-// F32 values are zero-extended to 64 bits: burst_buf = {32'h0, f32_value}.
-// ULP distance computed on the 64-bit representation; since upper 32 bits are
-// both zero, this equals the F32 ULP distance for positive values.
+// result_checker — compare INT16 Q8.8 hardware outputs against golden reference
+// INT16 values zero-extended to 64 bits: burst_buf = {48'h0, int16_value}.
+// Distance = absolute difference on 64-bit word (== LSB distance for Q8.8).
 //
-// Scenario: z=1.5, x_in=[0,0,0], P_in=I3, r=5.0 (F32)
-//   S=6.0, K=[1/6,0,0], x_out=[0.25,0,0], P_out=diag(5/6,1,1)
+// Scenario: z=1.5, x_in=[0,0,0], P_in=I3, R=5.0  (all Q8.8)
+//   S_Q88=0x0600, S_inv=42(=0x002A), K[0]=42, ky[0]=63
+//   x_out=[0x003F,0,0], P_out=[0x00D6,0,0,0,0x0100,0,0,0,0x0100]
 // -----------------------------------------------------------------------------
 module result_checker #(
     parameter int ULP_THRESHOLD = 4
 )();
-    // Golden reference — F32 bit patterns, zero-extended to 64 bits
+    // Golden reference — INT16 Q8.8 values, zero-extended to 64 bits
     logic [63:0] REF_XOUT [0:2];
     logic [63:0] REF_POUT [0:8];
 
@@ -184,23 +184,23 @@ module result_checker #(
 
     integer _i;
     initial begin
-        // x_out[0] = 0.25 in F32 = 0x3E800000
-        REF_XOUT[0] = 64'h000000003E800000;
+        // x_out[0] = 63/256 ≈ 0.246 (K[0]*y = 42*384>>8 = 63 = 0x003F)
+        REF_XOUT[0] = 64'h000000000000003F;
         REF_XOUT[1] = 64'h0000000000000000;
         REF_XOUT[2] = 64'h0000000000000000;
 
-        // P_out[0,0] = 5/6 in F32 = 0x3F555555 (nearest even rounding)
-        REF_POUT[0] = 64'h000000003F555555;
+        // P_out[0,0] = 214/256 ≈ 0.836 (1.0 - K[0]*P[0,0] = 256-42 = 214 = 0x00D6)
+        REF_POUT[0] = 64'h00000000000000D6;
         REF_POUT[1] = 64'h0000000000000000;
         REF_POUT[2] = 64'h0000000000000000;
         REF_POUT[3] = 64'h0000000000000000;
-        // P_out[1,1] = 1.0 in F32 = 0x3F800000
-        REF_POUT[4] = 64'h000000003F800000;
+        // P_out[1,1] = 1.0 = 0x0100 (K[1]=0, no change)
+        REF_POUT[4] = 64'h0000000000000100;
         REF_POUT[5] = 64'h0000000000000000;
         REF_POUT[6] = 64'h0000000000000000;
         REF_POUT[7] = 64'h0000000000000000;
-        // P_out[2,2] = 1.0 in F32 = 0x3F800000
-        REF_POUT[8] = 64'h000000003F800000;
+        // P_out[2,2] = 1.0 = 0x0100
+        REF_POUT[8] = 64'h0000000000000100;
 
         for (_i = 0; _i < 3; _i = _i + 1) hw_x[_i] = 64'h0;
         for (_i = 0; _i < 9; _i = _i + 1) hw_p[_i] = 64'h0;
@@ -249,9 +249,10 @@ endmodule
 
 
 // -----------------------------------------------------------------------------
-// program_block — F32 test scenario data
-// Scenario: z=1.5, x_in=[0,0,0], P_in=I3, r=5.0
-// All values stored as {32'h0, F32_value} in 64-bit burst_buf entries.
+// program_block — INT16 Q8.8 test scenario data
+// Scenario: z=1.5, x_in=[0,0,0], P_in=I3, R=5.0
+// All values stored as {48'h0, Q8.8_value} in 64-bit burst_buf entries.
+// Q8.8: real_value * 256.  z=1.5→0x0180, 1.0→0x0100, 5.0→0x0500.
 // -----------------------------------------------------------------------------
 module program_block (
     input  logic clk
@@ -262,20 +263,20 @@ module program_block (
 
     integer _i;
     initial begin
-        // z = 1.5 in F32 = 0x3FC00000
-        Z_VAL  = 64'h000000003FC00000;
+        // z = 1.5 in Q8.8 = 384 = 0x0180
+        Z_VAL  = 64'h0000000000000180;
 
-        X_IN[0] = 64'h0000000000000000; // 0.0
+        X_IN[0] = 64'h0000000000000000;
         X_IN[1] = 64'h0000000000000000;
         X_IN[2] = 64'h0000000000000000;
 
-        // Identity matrix (row-major), F32 1.0 = 0x3F800000
+        // Identity matrix (row-major), Q8.8 1.0 = 0x0100
         for (_i = 0; _i < 9; _i = _i + 1) P_IN[_i] = 64'h0;
-        P_IN[0] = 64'h000000003F800000; // 1.0 [0,0]
-        P_IN[4] = 64'h000000003F800000; // 1.0 [1,1]
-        P_IN[8] = 64'h000000003F800000; // 1.0 [2,2]
+        P_IN[0] = 64'h0000000000000100; // 1.0 [0,0]
+        P_IN[4] = 64'h0000000000000100; // 1.0 [1,1]
+        P_IN[8] = 64'h0000000000000100; // 1.0 [2,2]
     end
-    // R_REG default (5.0 F32 = 0x40A00000) is loaded at reset — no explicit write needed
+    // R_REG default (5.0 Q8.8 = 0x0500) loaded at reset — no explicit write needed
 endmodule
 
 
@@ -336,7 +337,7 @@ module tb_top;
         rst_n = 1'b1;
         repeat(10) @(posedge clk);
 
-        $display("=== SPI Kalman update test (F32 Option A) ===");
+        $display("=== SPI Kalman update test (INT16 Q8.8) ===");
 
         // Write z (reg 2) and x_in[0:2] (regs 3-5) in one burst of 4
         u_bfm.burst_buf[0] = u_prog.Z_VAL;

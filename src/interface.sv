@@ -1,73 +1,50 @@
 `timescale 1ns/1ps
 // =============================================================================
 // interface.sv — SPI slave register file for tt_um_joram200
-// Task 5 Option A: core data widths are F32 (32-bit per element).
+// INT16 Q8.8 fixed-point version.
 //
 // Protocol: CPOL=0, CPHA=0, MSB-first, 8-bit frames.
-// Transaction format: 1 command byte then N×8 data bytes while CS_N is low.
-// Command byte: bit[7]=R/W (1=write, 0=read), bits[6:0]=start register address.
-// Each register = 8 data bytes (64-bit SPI word). Address auto-increments
-// by 1 per completed 64-bit word within a CS_N-low burst.
-//
-// F32 data occupies the LOWER 32 bits of each 64-bit SPI word.
-// Host sends: [63:32]=zeros, [31:0]=F32 value (MSB-first byte order).
-// DUT returns: [63:32]=zeros, [31:0]=F32 value.
+// Transaction: 1 command byte + 8 data bytes (64-bit SPI word).
+// Command byte: bit[7]=R/W (1=write, 0=read), bits[6:0]=register address.
+// INT16 value occupies the LOWER 16 bits of each 64-bit SPI word.
+// Host sends: [63:16]=zeros, [15:0]=Q8.8 value (MSB-first byte order).
 //
 // Register map (28 registers, indices 0–27):
-//   0   CTRL      W      [0]=start one-shot pulse, [1]=sw_rst (level)
-//   1   STAT      R      [0]=done_latch (clears on STAT read), [1]=busy
-//   2   z         W      scalar measurement F32
-//   3   x_in[0]   W      prior state element 0 F32
-//   4   x_in[1]   W      prior state element 1 F32
-//   5   x_in[2]   W      prior state element 2 F32
-//   6   x_out[0]  R      corrected state element 0 F32
-//   7   x_out[1]  R      corrected state element 1 F32
-//   8   x_out[2]  R      corrected state element 2 F32
-//   9   P_in[0]   W      prior covariance [0,0] F32
-//  10   P_in[1]   W      [0,1]
-//  11   P_in[2]   W      [0,2]
-//  12   P_in[3]   W      [1,0]
-//  13   P_in[4]   W      [1,1]
-//  14   P_in[5]   W      [1,2]
-//  15   P_in[6]   W      [2,0]
-//  16   P_in[7]   W      [2,1]
-//  17   P_in[8]   W      [2,2]
-//  18   P_out[0]  R      updated covariance [0,0] F32
-//  19   P_out[1]  R      [0,1]
-//  20   P_out[2]  R      [0,2]
-//  21   P_out[3]  R      [1,0]
-//  22   P_out[4]  R      [1,1]
-//  23   P_out[5]  R      [1,2]
-//  24   P_out[6]  R      [2,0]
-//  25   P_out[7]  R      [2,1]
-//  26   P_out[8]  R      [2,2]
-//  27   R_REG     R/W    measurement noise R; reset default = 5.0 F32
+//   0   CTRL      W      [0]=start one-shot, [1]=sw_rst (level)
+//   1   STAT      R      [0]=done_latch (clears on read), [1]=busy
+//   2   z         W      scalar measurement Q8.8
+//   3   x_in[0]   W      prior state element 0 Q8.8
+//   4   x_in[1]   W      prior state element 1 Q8.8
+//   5   x_in[2]   W      prior state element 2 Q8.8
+//   6   x_out[0]  R      corrected state element 0 Q8.8
+//   7   x_out[1]  R      corrected state element 1 Q8.8
+//   8   x_out[2]  R      corrected state element 2 Q8.8
+//   9   P_in[0]   W      prior covariance [0,0] Q8.8
+//  10–17 P_in[1–8] W     [row-major]
+//  18–26 P_out[0–8] R    updated covariance [row-major]
+//  27   R_REG     R/W   measurement noise R; reset default = 5.0 (0x0500)
 // =============================================================================
 module spi_slave (
     input  logic        clk,
     input  logic        rst_n,
-    // SPI pins (CPOL=0, CPHA=0)
     input  logic        sclk,
     input  logic        mosi,
     input  logic        cs_n,
     output logic        miso,
-    // Core control
-    output logic        core_start,   // 1-cycle pulse when CTRL[0] written as 1
-    output logic        sw_rst,       // level: mirrors CTRL[1]
-    // Kalman inputs (written by host) — F32 widths
-    output logic [31:0]  z_reg,
-    output logic [95:0]  x_in_reg,   // 3×32 prior state
-    output logic [287:0] P_in_reg,   // 9×32 prior covariance
-    output logic [31:0]  r_val,      // R_REG; reset default = 5.0 F32
-    // Kalman status / outputs (read by host) — F32 widths
+    output logic        core_start,
+    output logic        sw_rst,
+    output logic [15:0] z_reg,
+    output logic [47:0]  x_in_reg,    // 3×16
+    output logic [143:0] P_in_reg,    // 9×16
+    output logic [15:0] r_val,
     input  logic        done,
     input  logic        busy,
-    input  logic [95:0]  x_out,      // 3×32
-    input  logic [287:0] P_out       // 9×32
+    input  logic [47:0]  x_out,       // 3×16
+    input  logic [143:0] P_out        // 9×16
 );
 
     // -------------------------------------------------------------------------
-    // Two-stage synchroniser for SPI pins → clk domain
+    // Two-stage synchroniser
     // -------------------------------------------------------------------------
     logic sclk_r1, sclk_r2;
     logic cs_n_r1, cs_n_r2;
@@ -79,8 +56,8 @@ module spi_slave (
             cs_n_r1 <= 1'b1; cs_n_r2 <= 1'b1;
             mosi_r  <= 1'b0;
         end else begin
-            sclk_r1 <= sclk;   sclk_r2 <= sclk_r1;
-            cs_n_r1 <= cs_n;   cs_n_r2 <= cs_n_r1;
+            sclk_r1 <= sclk;  sclk_r2 <= sclk_r1;
+            cs_n_r1 <= cs_n;  cs_n_r2 <= cs_n_r1;
             mosi_r  <= mosi;
         end
     end
@@ -92,7 +69,7 @@ module spi_slave (
     wire cs_active = !cs_n_r1;
 
     // -------------------------------------------------------------------------
-    // Transaction state machine
+    // SPI state machine
     // -------------------------------------------------------------------------
     typedef enum logic [1:0] {
         ST_IDLE = 2'd0,
@@ -101,92 +78,81 @@ module spi_slave (
     } spi_st_t;
 
     spi_st_t st;
-
-    logic [2:0] bit_cnt;   // bit position within current byte
-    logic [2:0] byte_cnt;  // byte index within current 64-bit word
-    logic       rw;        // 1=write, 0=read
-    logic [6:0] cur_addr;  // current register address
-
-    // Incoming shift register
+    logic [2:0] bit_cnt;
+    logic [2:0] byte_cnt;
+    logic       rw;
+    logic [6:0] cur_addr;
     logic [7:0]  rx_byte;
-    logic [55:0] rx_acc;   // accumulates bytes 0..6
-
-    // MISO shift register (64-bit for SPI word)
+    logic [55:0] rx_acc;
     logic [63:0] tx_shift;
+    logic        done_latch;
 
-    // done latch
-    logic done_latch;
+    localparam logic [15:0] R_DEFAULT = 16'h0500; // 5.0 in Q8.8
 
-    // Default R value (5.0 in F32)
-    localparam logic [31:0] R_DEFAULT = 32'h40A0_0000; // 5.0 F32
+    // Unpack x_out and P_out for read function
+    logic [15:0] x_out_arr [0:2];
+    logic [15:0] P_out_arr [0:8];
 
-    // Unpack flat input ports to internal arrays for x_out and P_out
-    logic [31:0] x_out_arr [0:2];
-    logic [31:0] P_out_arr [0:8];
+    assign x_out_arr[0] = x_out[15:0];
+    assign x_out_arr[1] = x_out[31:16];
+    assign x_out_arr[2] = x_out[47:32];
 
-    assign x_out_arr[0] = x_out[31:0];
-    assign x_out_arr[1] = x_out[63:32];
-    assign x_out_arr[2] = x_out[95:64];
+    assign P_out_arr[0] = P_out[15:0];
+    assign P_out_arr[1] = P_out[31:16];
+    assign P_out_arr[2] = P_out[47:32];
+    assign P_out_arr[3] = P_out[63:48];
+    assign P_out_arr[4] = P_out[79:64];
+    assign P_out_arr[5] = P_out[95:80];
+    assign P_out_arr[6] = P_out[111:96];
+    assign P_out_arr[7] = P_out[127:112];
+    assign P_out_arr[8] = P_out[143:128];
 
-    assign P_out_arr[0] = P_out[31:0];
-    assign P_out_arr[1] = P_out[63:32];
-    assign P_out_arr[2] = P_out[95:64];
-    assign P_out_arr[3] = P_out[127:96];
-    assign P_out_arr[4] = P_out[159:128];
-    assign P_out_arr[5] = P_out[191:160];
-    assign P_out_arr[6] = P_out[223:192];
-    assign P_out_arr[7] = P_out[255:224];
-    assign P_out_arr[8] = P_out[287:256];
+    // Stored prior state/covariance (written by host before start)
+    logic [15:0] x_in_arr [0:2];
+    logic [15:0] P_in_arr [0:8];
 
-    // Stored prior state/covariance (written by host before triggering start)
-    logic [31:0] x_in_arr [0:2];
-    logic [31:0] P_in_arr [0:8];
-
-    // Pack to output buses
     assign x_in_reg = {x_in_arr[2], x_in_arr[1], x_in_arr[0]};
     assign P_in_reg = {P_in_arr[8], P_in_arr[7], P_in_arr[6],
                        P_in_arr[5], P_in_arr[4], P_in_arr[3],
                        P_in_arr[2], P_in_arr[1], P_in_arr[0]};
 
     // -------------------------------------------------------------------------
-    // Register read function — returns 64-bit SPI word.
-    // F32 values are zero-extended: {32'h0, f32_value}.
+    // Register read: returns {48'h0, int16_value} in 64-bit SPI word
     // -------------------------------------------------------------------------
     function automatic logic [63:0] reg_read_fn (input logic [6:0] addr);
         case (addr)
             7'd1:  reg_read_fn = {62'b0, busy, done_latch};
-            7'd6:  reg_read_fn = {32'h0, x_out_arr[0]};
-            7'd7:  reg_read_fn = {32'h0, x_out_arr[1]};
-            7'd8:  reg_read_fn = {32'h0, x_out_arr[2]};
-            7'd18: reg_read_fn = {32'h0, P_out_arr[0]};
-            7'd19: reg_read_fn = {32'h0, P_out_arr[1]};
-            7'd20: reg_read_fn = {32'h0, P_out_arr[2]};
-            7'd21: reg_read_fn = {32'h0, P_out_arr[3]};
-            7'd22: reg_read_fn = {32'h0, P_out_arr[4]};
-            7'd23: reg_read_fn = {32'h0, P_out_arr[5]};
-            7'd24: reg_read_fn = {32'h0, P_out_arr[6]};
-            7'd25: reg_read_fn = {32'h0, P_out_arr[7]};
-            7'd26: reg_read_fn = {32'h0, P_out_arr[8]};
-            7'd27: reg_read_fn = {32'h0, r_val};
+            7'd6:  reg_read_fn = {48'h0, x_out_arr[0]};
+            7'd7:  reg_read_fn = {48'h0, x_out_arr[1]};
+            7'd8:  reg_read_fn = {48'h0, x_out_arr[2]};
+            7'd18: reg_read_fn = {48'h0, P_out_arr[0]};
+            7'd19: reg_read_fn = {48'h0, P_out_arr[1]};
+            7'd20: reg_read_fn = {48'h0, P_out_arr[2]};
+            7'd21: reg_read_fn = {48'h0, P_out_arr[3]};
+            7'd22: reg_read_fn = {48'h0, P_out_arr[4]};
+            7'd23: reg_read_fn = {48'h0, P_out_arr[5]};
+            7'd24: reg_read_fn = {48'h0, P_out_arr[6]};
+            7'd25: reg_read_fn = {48'h0, P_out_arr[7]};
+            7'd26: reg_read_fn = {48'h0, P_out_arr[8]};
+            7'd27: reg_read_fn = {48'h0, r_val};
             default: reg_read_fn = 64'h0;
         endcase
     endfunction
 
-    // Pre-compute constant bit/range-selects as wires (iverilog 12 "sorry" fix).
+    // Pre-compute constant bit/range-selects (iverilog 12 "sorry" fix)
     wire [63:0] tx_shift_shifted = {tx_shift[62:0], 1'b0};
     wire        miso_hold        = tx_shift[63];
 
-    // rx_byte slices
     wire [6:0] rx_byte_lo   = rx_byte[6:0];
     wire       rx_byte_b6   = rx_byte[6];
     wire [5:0] rx_byte_b5_0 = rx_byte[5:0];
     wire       rx_byte_b0   = rx_byte[0];
 
-    // rx_acc slices
-    wire [47:0] rx_acc_lo   = rx_acc[47:0];   // for accumulation
-    // Lower 32-bit word extraction: bytes 4..7 of the 64-bit SPI word.
-    // rx_acc[23:0] = bytes 4..6 (3 bytes), then rx_byte_lo (7 bits) + mosi_r (1 bit) = byte 7.
-    wire [23:0] rx_acc_lo24 = rx_acc[23:0];   // for F32 lower-word extraction
+    wire [47:0] rx_acc_lo   = rx_acc[47:0];
+
+    // INT16 extraction: lower 16 bits of 64-bit SPI word = bytes 6 and 7
+    // byte 6 = rx_acc[7:0], byte 7 = {rx_byte[6:0], mosi_r}
+    wire [7:0] rx_acc_b6 = rx_acc[7:0];
 
     // -------------------------------------------------------------------------
     // Main sequential block
@@ -203,14 +169,14 @@ module spi_slave (
             tx_shift   <= 64'h0;
             miso       <= 1'b0;
             done_latch <= 1'b0;
-            core_start   <= 1'b0;
-            sw_rst       <= 1'b0;
-            z_reg        <= 32'h0;
-            x_in_arr[0]  <= 32'h0; x_in_arr[1]  <= 32'h0; x_in_arr[2]  <= 32'h0;
-            P_in_arr[0]  <= 32'h0; P_in_arr[1]  <= 32'h0; P_in_arr[2]  <= 32'h0;
-            P_in_arr[3]  <= 32'h0; P_in_arr[4]  <= 32'h0; P_in_arr[5]  <= 32'h0;
-            P_in_arr[6]  <= 32'h0; P_in_arr[7]  <= 32'h0; P_in_arr[8]  <= 32'h0;
-            r_val        <= R_DEFAULT;
+            core_start <= 1'b0;
+            sw_rst     <= 1'b0;
+            z_reg      <= 16'h0;
+            x_in_arr[0] <= 16'h0; x_in_arr[1] <= 16'h0; x_in_arr[2] <= 16'h0;
+            P_in_arr[0] <= 16'h0; P_in_arr[1] <= 16'h0; P_in_arr[2] <= 16'h0;
+            P_in_arr[3] <= 16'h0; P_in_arr[4] <= 16'h0; P_in_arr[5] <= 16'h0;
+            P_in_arr[6] <= 16'h0; P_in_arr[7] <= 16'h0; P_in_arr[8] <= 16'h0;
+            r_val       <= R_DEFAULT;
         end else begin
             core_start <= 1'b0;
 
@@ -224,9 +190,7 @@ module spi_slave (
                 rx_acc   <= 56'h0;
             end
 
-            if (cs_rise) begin
-                st <= ST_IDLE;
-            end
+            if (cs_rise) st <= ST_IDLE;
 
             if (sclk_rise && cs_active) begin
                 case (st)
@@ -255,33 +219,31 @@ module spi_slave (
                         if (bit_cnt == 3'd7) begin
                             bit_cnt <= 3'd0;
                             if (byte_cnt == 3'd7) begin
-                                // ---- 64-bit word complete ----
-                                // F32 value = lower 32 bits of SPI word
-                                //   = {rx_acc_lo24[23:0], rx_byte_lo[6:0], mosi_r[0]}
+                                // 64-bit word complete
+                                // INT16 = lower 16 bits = bytes 6 and 7
                                 byte_cnt <= 3'd0;
                                 rx_acc   <= 56'h0;
                                 rx_byte  <= 8'h0;
                                 if (rw) begin
                                     case (cur_addr)
                                         7'd0: begin
-                                            // CTRL: bit[0]=start, bit[1]=sw_rst
                                             core_start <= mosi_r;
                                             sw_rst     <= rx_byte_b0;
                                         end
-                                        7'd2:  z_reg <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        7'd3:  x_in_arr[0] <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        7'd4:  x_in_arr[1] <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        7'd5:  x_in_arr[2] <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        7'd9:  P_in_arr[0] <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        7'd10: P_in_arr[1] <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        7'd11: P_in_arr[2] <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        7'd12: P_in_arr[3] <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        7'd13: P_in_arr[4] <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        7'd14: P_in_arr[5] <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        7'd15: P_in_arr[6] <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        7'd16: P_in_arr[7] <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        7'd17: P_in_arr[8] <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        7'd27: r_val <= {rx_acc_lo24, rx_byte_lo, mosi_r};
+                                        7'd2:  z_reg        <= {rx_acc_b6, rx_byte_lo, mosi_r};
+                                        7'd3:  x_in_arr[0]  <= {rx_acc_b6, rx_byte_lo, mosi_r};
+                                        7'd4:  x_in_arr[1]  <= {rx_acc_b6, rx_byte_lo, mosi_r};
+                                        7'd5:  x_in_arr[2]  <= {rx_acc_b6, rx_byte_lo, mosi_r};
+                                        7'd9:  P_in_arr[0]  <= {rx_acc_b6, rx_byte_lo, mosi_r};
+                                        7'd10: P_in_arr[1]  <= {rx_acc_b6, rx_byte_lo, mosi_r};
+                                        7'd11: P_in_arr[2]  <= {rx_acc_b6, rx_byte_lo, mosi_r};
+                                        7'd12: P_in_arr[3]  <= {rx_acc_b6, rx_byte_lo, mosi_r};
+                                        7'd13: P_in_arr[4]  <= {rx_acc_b6, rx_byte_lo, mosi_r};
+                                        7'd14: P_in_arr[5]  <= {rx_acc_b6, rx_byte_lo, mosi_r};
+                                        7'd15: P_in_arr[6]  <= {rx_acc_b6, rx_byte_lo, mosi_r};
+                                        7'd16: P_in_arr[7]  <= {rx_acc_b6, rx_byte_lo, mosi_r};
+                                        7'd17: P_in_arr[8]  <= {rx_acc_b6, rx_byte_lo, mosi_r};
+                                        7'd27: r_val        <= {rx_acc_b6, rx_byte_lo, mosi_r};
                                         default: ;
                                     endcase
                                 end

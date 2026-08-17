@@ -43,13 +43,13 @@ module tt_um_joram200 (
     logic        core_start, sw_rst_w;
     logic        core_done,  core_busy;
 
-    // Register file wires — F32 widths
-    logic [31:0]  z_w;
-    logic [31:0]  r_val_w;
-    logic [95:0]  x_in_w;   // 3×32
-    logic [287:0] P_in_w;   // 9×32
-    logic [95:0]  x_out_w;  // 3×32
-    logic [287:0] P_out_w;  // 9×32
+    // Register file wires — INT16 Q8.8 widths
+    logic [15:0]  z_w;
+    logic [15:0]  r_val_w;
+    logic [47:0]  x_in_w;   // 3×16
+    logic [143:0] P_in_w;   // 9×16
+    logic [47:0]  x_out_w;  // 3×16
+    logic [143:0] P_out_w;  // 9×16
 
     // SPI slave
     spi_slave u_spi (
