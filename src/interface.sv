@@ -56,13 +56,8 @@ module spi_slave (
     output logic        sw_rst,       // level: mirrors CTRL[1]
     // Kalman inputs (written by host) — F32 widths
     output logic [31:0]  z_reg,
-    // Write-event ports: emitted when host writes x_in (addrs 3-5) or P_in (addrs 9-17)
-    output logic        x_wr_en,
-    output logic [1:0]  x_wr_idx,
-    output logic [31:0] x_wr_val,
-    output logic        p_wr_en,
-    output logic [3:0]  p_wr_idx,
-    output logic [31:0] p_wr_val,
+    output logic [95:0]  x_in_reg,   // 3×32
+    output logic [287:0] P_in_reg,   // 9×32
     output logic [31:0]  r_val,      // R_REG; reset default = 5.0 F32
     // Kalman status / outputs (read by host) — F32 widths
     input  logic        done,
@@ -124,6 +119,25 @@ module spi_slave (
 
     // Default R value (5.0 in F32)
     localparam logic [31:0] R_DEFAULT = 32'h40A0_0000; // 5.0 F32
+
+    // Internal unpacked arrays for x_in and P_in (F32, 32-bit each)
+    logic [31:0] x_in_arr [0:2];
+    logic [31:0] P_in_arr [0:8];
+
+    // Pack internal arrays to flat output ports (3×32=96, 9×32=288)
+    assign x_in_reg[31:0]    = x_in_arr[0];
+    assign x_in_reg[63:32]   = x_in_arr[1];
+    assign x_in_reg[95:64]   = x_in_arr[2];
+
+    assign P_in_reg[31:0]    = P_in_arr[0];
+    assign P_in_reg[63:32]   = P_in_arr[1];
+    assign P_in_reg[95:64]   = P_in_arr[2];
+    assign P_in_reg[127:96]  = P_in_arr[3];
+    assign P_in_reg[159:128] = P_in_arr[4];
+    assign P_in_reg[191:160] = P_in_arr[5];
+    assign P_in_reg[223:192] = P_in_arr[6];
+    assign P_in_reg[255:224] = P_in_arr[7];
+    assign P_in_reg[287:256] = P_in_arr[8];
 
     // Unpack flat input ports to internal arrays for x_out and P_out
     logic [31:0] x_out_arr [0:2];
@@ -200,18 +214,22 @@ module spi_slave (
             done_latch <= 1'b0;
             core_start <= 1'b0;
             sw_rst     <= 1'b0;
-            z_reg      <= 32'h0;
-            x_wr_en    <= 1'b0;
-            x_wr_idx   <= 2'd0;
-            x_wr_val   <= 32'h0;
-            p_wr_en    <= 1'b0;
-            p_wr_idx   <= 4'd0;
-            p_wr_val   <= 32'h0;
-            r_val      <= R_DEFAULT;
+            z_reg         <= 32'h0;
+            x_in_arr[0]   <= 32'h0;
+            x_in_arr[1]   <= 32'h0;
+            x_in_arr[2]   <= 32'h0;
+            P_in_arr[0]   <= 32'h0;
+            P_in_arr[1]   <= 32'h0;
+            P_in_arr[2]   <= 32'h0;
+            P_in_arr[3]   <= 32'h0;
+            P_in_arr[4]   <= 32'h0;
+            P_in_arr[5]   <= 32'h0;
+            P_in_arr[6]   <= 32'h0;
+            P_in_arr[7]   <= 32'h0;
+            P_in_arr[8]   <= 32'h0;
+            r_val         <= R_DEFAULT;
         end else begin
             core_start <= 1'b0;
-            x_wr_en    <= 1'b0;
-            p_wr_en    <= 1'b0;
 
             if (done) done_latch <= 1'b1;
 
@@ -267,56 +285,20 @@ module spi_slave (
                                             core_start <= mosi_r;
                                             sw_rst     <= rx_byte_b0;
                                         end
-                                        7'd2:  z_reg <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        7'd3: begin
-                                            x_wr_en  <= 1'b1; x_wr_idx <= 2'd0;
-                                            x_wr_val <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        end
-                                        7'd4: begin
-                                            x_wr_en  <= 1'b1; x_wr_idx <= 2'd1;
-                                            x_wr_val <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        end
-                                        7'd5: begin
-                                            x_wr_en  <= 1'b1; x_wr_idx <= 2'd2;
-                                            x_wr_val <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        end
-                                        7'd9: begin
-                                            p_wr_en  <= 1'b1; p_wr_idx <= 4'd0;
-                                            p_wr_val <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        end
-                                        7'd10: begin
-                                            p_wr_en  <= 1'b1; p_wr_idx <= 4'd1;
-                                            p_wr_val <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        end
-                                        7'd11: begin
-                                            p_wr_en  <= 1'b1; p_wr_idx <= 4'd2;
-                                            p_wr_val <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        end
-                                        7'd12: begin
-                                            p_wr_en  <= 1'b1; p_wr_idx <= 4'd3;
-                                            p_wr_val <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        end
-                                        7'd13: begin
-                                            p_wr_en  <= 1'b1; p_wr_idx <= 4'd4;
-                                            p_wr_val <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        end
-                                        7'd14: begin
-                                            p_wr_en  <= 1'b1; p_wr_idx <= 4'd5;
-                                            p_wr_val <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        end
-                                        7'd15: begin
-                                            p_wr_en  <= 1'b1; p_wr_idx <= 4'd6;
-                                            p_wr_val <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        end
-                                        7'd16: begin
-                                            p_wr_en  <= 1'b1; p_wr_idx <= 4'd7;
-                                            p_wr_val <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        end
-                                        7'd17: begin
-                                            p_wr_en  <= 1'b1; p_wr_idx <= 4'd8;
-                                            p_wr_val <= {rx_acc_lo24, rx_byte_lo, mosi_r};
-                                        end
-                                        7'd27: r_val <= {rx_acc_lo24, rx_byte_lo, mosi_r};
+                                        7'd2:  z_reg         <= {rx_acc_lo24, rx_byte_lo, mosi_r};
+                                        7'd3:  x_in_arr[0]   <= {rx_acc_lo24, rx_byte_lo, mosi_r};
+                                        7'd4:  x_in_arr[1]   <= {rx_acc_lo24, rx_byte_lo, mosi_r};
+                                        7'd5:  x_in_arr[2]   <= {rx_acc_lo24, rx_byte_lo, mosi_r};
+                                        7'd9:  P_in_arr[0]   <= {rx_acc_lo24, rx_byte_lo, mosi_r};
+                                        7'd10: P_in_arr[1]   <= {rx_acc_lo24, rx_byte_lo, mosi_r};
+                                        7'd11: P_in_arr[2]   <= {rx_acc_lo24, rx_byte_lo, mosi_r};
+                                        7'd12: P_in_arr[3]   <= {rx_acc_lo24, rx_byte_lo, mosi_r};
+                                        7'd13: P_in_arr[4]   <= {rx_acc_lo24, rx_byte_lo, mosi_r};
+                                        7'd14: P_in_arr[5]   <= {rx_acc_lo24, rx_byte_lo, mosi_r};
+                                        7'd15: P_in_arr[6]   <= {rx_acc_lo24, rx_byte_lo, mosi_r};
+                                        7'd16: P_in_arr[7]   <= {rx_acc_lo24, rx_byte_lo, mosi_r};
+                                        7'd17: P_in_arr[8]   <= {rx_acc_lo24, rx_byte_lo, mosi_r};
+                                        7'd27: r_val         <= {rx_acc_lo24, rx_byte_lo, mosi_r};
                                         default: ;
                                     endcase
                                 end

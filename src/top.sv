@@ -45,17 +45,11 @@ module tt_um_joram200 (
 
     // Register file wires — F32 widths
     logic [31:0]  z_w;
+    logic [95:0]  x_in_w;   // 3×32
+    logic [287:0] P_in_w;   // 9×32
     logic [31:0]  r_val_w;
     logic [95:0]  x_out_w;  // 3×32
     logic [287:0] P_out_w;  // 9×32
-
-    // Write-event wires (SPI interface → kalman_update)
-    logic        x_wr_en_w;
-    logic [1:0]  x_wr_idx_w;
-    logic [31:0] x_wr_val_w;
-    logic        p_wr_en_w;
-    logic [3:0]  p_wr_idx_w;
-    logic [31:0] p_wr_val_w;
 
     // SPI slave
     spi_slave u_spi (
@@ -68,12 +62,8 @@ module tt_um_joram200 (
         .core_start (core_start),
         .sw_rst     (sw_rst_w),
         .z_reg      (z_w),
-        .x_wr_en    (x_wr_en_w),
-        .x_wr_idx   (x_wr_idx_w),
-        .x_wr_val   (x_wr_val_w),
-        .p_wr_en    (p_wr_en_w),
-        .p_wr_idx   (p_wr_idx_w),
-        .p_wr_val   (p_wr_val_w),
+        .x_in_reg   (x_in_w),
+        .P_in_reg   (P_in_w),
         .r_val      (r_val_w),
         .done       (core_done),
         .busy       (core_busy),
@@ -83,21 +73,17 @@ module tt_um_joram200 (
 
     // Kalman update core; soft-reset via sw_rst from SPI slave
     kalman_update u_core (
-        .clk       (clk),
-        .rst_n     (rst_n & ~sw_rst_w),
-        .start     (core_start),
-        .z         (z_w),
-        .x_wr_en   (x_wr_en_w),
-        .x_wr_idx  (x_wr_idx_w),
-        .x_wr_val  (x_wr_val_w),
-        .p_wr_en   (p_wr_en_w),
-        .p_wr_idx  (p_wr_idx_w),
-        .p_wr_val  (p_wr_val_w),
-        .r_val     (r_val_w),
-        .x_out     (x_out_w),
-        .P_out     (P_out_w),
-        .done      (core_done),
-        .busy      (core_busy)
+        .clk    (clk),
+        .rst_n  (rst_n & ~sw_rst_w),
+        .start  (core_start),
+        .z      (z_w),
+        .x_in   (x_in_w),
+        .P_in   (P_in_w),
+        .r_val  (r_val_w),
+        .x_out  (x_out_w),
+        .P_out  (P_out_w),
+        .done   (core_done),
+        .busy   (core_busy)
     );
 
     // Status outputs
