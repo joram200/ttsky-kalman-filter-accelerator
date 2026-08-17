@@ -25,7 +25,7 @@ $(VVP): $(SRCS) $(TB)
 results.xml: $(VVP)
 	@if vvp $< -fst > sim.log 2>&1; then \
 	    cat sim.log; \
-	    printf '<?xml version="1.0"?>\n<testsuites><testsuite name="tb_top" tests="1" failures="0"><testcase name="test_kalman_spi"/></testsuite></testsuites>\n' > $@; \
+	    printf '<?xml version="1.0"?>\n<testsuites><testsuite name="tb_top" tests="1"><testcase name="test_kalman_spi"/></testsuite></testsuites>\n' > $@; \
 	    echo "RESULT: PASS"; \
 	else \
 	    cat sim.log; \
