@@ -1,222 +1,143 @@
 `timescale 1ns/1ps
 // =============================================================================
-// interface.sv — SPI slave register file for tt_um_joram200
+// interface.sv — Parallel GPIO register file for tt_um_joram200
 // INT16 Q8.8 fixed-point version, 1D (scalar) state.
 //
-// Protocol: CPOL=0, CPHA=0, MSB-first, 8-bit frames.
-// Transaction: 1 command byte + 2 data bytes (24-bit SPI word).
-// Command byte: bit[7]=R/W (1=write, 0=read), bits[6:0]=register address.
-// INT16 value occupies the 2 data bytes (MSB first).
+// Write protocol (byte-serial, MSB first):
+//   1. Place register address on addr[2:0], 0 on byte_sel, MSB byte on wr_data.
+//   2. Pulse wr_en high for ≥1 clk cycle → MSB stored.
+//   3. Place LSB byte on wr_data, 1 on byte_sel.
+//   4. Pulse wr_en again → LSB stored, 16-bit write complete.
+//
+// Read protocol (combinational):
+//   Set addr[2:0] and byte_sel; rd_data is valid the same cycle.
 //
 // Register map (8 registers, indices 0–7):
-//   0   CTRL      W    [0]=start one-shot, [1]=sw_rst (level)
-//   1   STAT      R    [0]=done_latch (clears on read), [1]=busy
+//   0   (reserved)
+//   1   STAT      R    [0]=done_latch (clears on next start), [1]=busy
 //   2   z         W    scalar measurement Q8.8
 //   3   x_in      W    prior scalar state Q8.8
 //   4   x_out     R    corrected scalar state Q8.8
 //   5   P_in      W    prior scalar covariance Q8.8
 //   6   P_out     R    updated scalar covariance Q8.8
 //   7   R_REG     R/W  measurement noise R; reset default = 5.0 (0x0500)
+//
+// Dedicated control pins (not register-mapped):
+//   start_in  → rising-edge one-shot core_start; also clears done_latch
+//   sw_rst_in → level, passed to kalman_update as combined reset
 // =============================================================================
-module spi_slave (
+module par_reg (
     input  logic        clk,
     input  logic        rst_n,
-    input  logic        sclk,
-    input  logic        mosi,
-    input  logic        cs_n,
-    output logic        miso,
+    // Parallel data/control inputs
+    input  logic [7:0]  wr_data,    // write data byte
+    input  logic [2:0]  addr,       // register address
+    input  logic        byte_sel,   // 0=MSB byte, 1=LSB byte
+    input  logic        wr_en,      // write enable (rising-edge triggered)
+    input  logic        start_in,   // start (rising-edge → one-shot core_start)
+    input  logic        sw_rst_in,  // software reset (level)
+    // Core control outputs
     output logic        core_start,
     output logic        sw_rst,
+    // Register file outputs
     output logic [15:0] z_reg,
     output logic [15:0] x_in_reg,
     output logic [15:0] P_in_reg,
     output logic [15:0] r_val,
+    // Core status inputs
     input  logic        done,
     input  logic        busy,
     input  logic [15:0] x_out,
-    input  logic [15:0] P_out
+    input  logic [15:0] P_out,
+    // Byte-wide read data output
+    output logic [7:0]  rd_data
 );
-
-    // -------------------------------------------------------------------------
-    // Two-stage synchroniser
-    // -------------------------------------------------------------------------
-    logic sclk_r1, sclk_r2;
-    logic cs_n_r1, cs_n_r2;
-    logic mosi_r;
-
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            sclk_r1 <= 1'b0; sclk_r2 <= 1'b0;
-            cs_n_r1 <= 1'b1; cs_n_r2 <= 1'b1;
-            mosi_r  <= 1'b0;
-        end else begin
-            sclk_r1 <= sclk;  sclk_r2 <= sclk_r1;
-            cs_n_r1 <= cs_n;  cs_n_r2 <= cs_n_r1;
-            mosi_r  <= mosi;
-        end
-    end
-
-    wire sclk_rise = ( sclk_r1 && !sclk_r2);
-    wire sclk_fall = (!sclk_r1 &&  sclk_r2);
-    wire cs_fall   = (!cs_n_r1 &&  cs_n_r2);
-    wire cs_rise   = ( cs_n_r1 && !cs_n_r2);
-    wire cs_active = !cs_n_r1;
-
-    // -------------------------------------------------------------------------
-    // SPI state machine
-    // -------------------------------------------------------------------------
-    typedef enum logic [1:0] {
-        ST_IDLE = 2'd0,
-        ST_CMD  = 2'd1,
-        ST_DATA = 2'd2
-    } spi_st_t;
-
-    spi_st_t st;
-    logic [2:0] bit_cnt;
-    logic       byte_cnt;   // 0 = first data byte (MSB), 1 = second data byte (LSB)
-    logic       rw;
-    logic [6:0] cur_addr;
-    logic [7:0] rx_byte;
-    logic [7:0] rx_hi;      // saved MSB of 16-bit data word
-    logic [15:0] tx_shift;
-    logic        done_latch;
 
     localparam logic [15:0] R_DEFAULT = 16'h0500; // 5.0 in Q8.8
 
-    // Stored prior state/covariance (written by host before start)
+    // -------------------------------------------------------------------------
+    // Two-stage synchronisers for edge-triggered control inputs
+    // -------------------------------------------------------------------------
+    logic wr_en_r1,  wr_en_r2;
+    logic start_r1,  start_r2;
+    logic sw_rst_r;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            wr_en_r1  <= 1'b0; wr_en_r2  <= 1'b0;
+            start_r1  <= 1'b0; start_r2  <= 1'b0;
+            sw_rst_r  <= 1'b0;
+        end else begin
+            wr_en_r1  <= wr_en;    wr_en_r2  <= wr_en_r1;
+            start_r1  <= start_in; start_r2  <= start_r1;
+            sw_rst_r  <= sw_rst_in;
+        end
+    end
+
+    wire wr_rise    = wr_en_r1  && !wr_en_r2;
+    wire start_rise = start_r1  && !start_r2;
+
+    assign sw_rst = sw_rst_r;
+
+    // -------------------------------------------------------------------------
+    // Register file
+    // -------------------------------------------------------------------------
     logic [15:0] x_in_r;
     logic [15:0] P_in_r;
+    logic        done_latch;
 
     assign x_in_reg = x_in_r;
     assign P_in_reg = P_in_r;
 
-    // -------------------------------------------------------------------------
-    // Register read: returns 16-bit value for 2-byte SPI data field
-    // -------------------------------------------------------------------------
-    function automatic logic [15:0] reg_read_fn (input logic [6:0] addr);
-        case (addr)
-            7'd1: reg_read_fn = {14'b0, busy, done_latch};
-            7'd4: reg_read_fn = x_out;
-            7'd6: reg_read_fn = P_out;
-            7'd7: reg_read_fn = r_val;
-            default: reg_read_fn = 16'h0;
-        endcase
-    endfunction
-
-    // Pre-compute constant bit/range-selects (iverilog "sorry" fix)
-    wire [15:0] tx_shift_shifted = {tx_shift[14:0], 1'b0};
-    wire        miso_hold        = tx_shift[15];
-
-    wire [6:0] rx_byte_lo   = rx_byte[6:0];
-    wire       rx_byte_b6   = rx_byte[6];
-    wire [5:0] rx_byte_b5_0 = rx_byte[5:0];
-    wire       rx_byte_b0   = rx_byte[0];
-
-    // -------------------------------------------------------------------------
-    // Main sequential block
-    // -------------------------------------------------------------------------
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            st         <= ST_IDLE;
-            bit_cnt    <= 3'd0;
-            byte_cnt   <= 1'b0;
-            rw         <= 1'b0;
-            cur_addr   <= 7'd0;
-            rx_byte    <= 8'h0;
-            rx_hi      <= 8'h0;
-            tx_shift   <= 16'h0;
-            miso       <= 1'b0;
-            done_latch <= 1'b0;
             core_start <= 1'b0;
-            sw_rst     <= 1'b0;
+            done_latch <= 1'b0;
             z_reg      <= 16'h0;
             x_in_r     <= 16'h0;
             P_in_r     <= 16'h0;
             r_val      <= R_DEFAULT;
         end else begin
-            core_start <= 1'b0;
+            core_start <= start_rise;
+            if (done)        done_latch <= 1'b1;
+            if (start_rise)  done_latch <= 1'b0;
 
-            if (done) done_latch <= 1'b1;
-
-            if (cs_fall) begin
-                st       <= ST_CMD;
-                bit_cnt  <= 3'd0;
-                byte_cnt <= 1'b0;
-                rx_byte  <= 8'h0;
-                rx_hi    <= 8'h0;
-            end
-
-            if (cs_rise) st <= ST_IDLE;
-
-            if (sclk_rise && cs_active) begin
-                case (st)
-
-                    ST_CMD: begin
-                        rx_byte <= {rx_byte_lo, mosi_r};
-                        if (bit_cnt == 3'd7) begin
-                            rw       <= rx_byte_b6;
-                            cur_addr <= {rx_byte_b5_0, mosi_r};
-                            st       <= ST_DATA;
-                            bit_cnt  <= 3'd0;
-                            byte_cnt <= 1'b0;
-                            rx_byte  <= 8'h0;
-                            rx_hi    <= 8'h0;
-                            if (!rx_byte_b6) begin
-                                tx_shift <= reg_read_fn({rx_byte_b5_0, mosi_r});
-                                if ({rx_byte_b5_0, mosi_r} == 7'd1) done_latch <= 1'b0;
-                            end
-                        end else begin
-                            bit_cnt <= bit_cnt + 3'd1;
-                        end
-                    end
-
-                    ST_DATA: begin
-                        rx_byte <= {rx_byte_lo, mosi_r};
-                        if (bit_cnt == 3'd7) begin
-                            bit_cnt <= 3'd0;
-                            if (byte_cnt == 1'b1) begin
-                                // Second (last) data byte complete — 16-bit word ready
-                                byte_cnt <= 1'b0;
-                                rx_byte  <= 8'h0;
-                                rx_hi    <= 8'h0;
-                                if (rw) begin
-                                    case (cur_addr)
-                                        7'd0: begin
-                                            core_start <= mosi_r;
-                                            sw_rst     <= rx_byte_b0;
-                                        end
-                                        7'd2: z_reg  <= {rx_hi, rx_byte_lo, mosi_r};
-                                        7'd3: x_in_r <= {rx_hi, rx_byte_lo, mosi_r};
-                                        7'd5: P_in_r <= {rx_hi, rx_byte_lo, mosi_r};
-                                        7'd7: r_val  <= {rx_hi, rx_byte_lo, mosi_r};
-                                        default: ;
-                                    endcase
-                                end
-                                cur_addr <= cur_addr + 7'd1;
-                                if (!rw) begin
-                                    tx_shift <= reg_read_fn(cur_addr + 7'd1);
-                                    if ((cur_addr + 7'd1) == 7'd1) done_latch <= 1'b0;
-                                end
-                            end else begin
-                                // First data byte (MSB) complete — save it
-                                rx_hi    <= {rx_byte_lo, mosi_r};
-                                byte_cnt <= 1'b1;
-                                rx_byte  <= 8'h0;
-                            end
-                        end else begin
-                            bit_cnt <= bit_cnt + 3'd1;
-                        end
-                    end
-
-                    default: ;
-                endcase
-            end
-
-            if (sclk_fall && cs_active) begin
-                miso     <= miso_hold;
-                tx_shift <= tx_shift_shifted;
+            if (wr_rise) begin
+                if (!byte_sel) begin
+                    case (addr)
+                        3'd2: z_reg[15:8]  <= wr_data;
+                        3'd3: x_in_r[15:8] <= wr_data;
+                        3'd5: P_in_r[15:8] <= wr_data;
+                        3'd7: r_val[15:8]  <= wr_data;
+                        default: ;
+                    endcase
+                end else begin
+                    case (addr)
+                        3'd2: z_reg[7:0]   <= wr_data;
+                        3'd3: x_in_r[7:0]  <= wr_data;
+                        3'd5: P_in_r[7:0]  <= wr_data;
+                        3'd7: r_val[7:0]   <= wr_data;
+                        default: ;
+                    endcase
+                end
             end
         end
     end
+
+    // -------------------------------------------------------------------------
+    // Combinational read mux (no sequential state — no MISO shift register)
+    // -------------------------------------------------------------------------
+    logic [15:0] rd_word;
+    always_comb begin
+        case (addr)
+            3'd1:    rd_word = {14'b0, busy, done_latch};
+            3'd4:    rd_word = x_out;
+            3'd6:    rd_word = P_out;
+            3'd7:    rd_word = r_val;
+            default: rd_word = 16'h0;
+        endcase
+    end
+
+    assign rd_data = byte_sel ? rd_word[7:0] : rd_word[15:8];
 
 endmodule

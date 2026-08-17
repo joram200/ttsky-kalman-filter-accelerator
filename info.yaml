@@ -24,34 +24,34 @@ project:
 # The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
 # This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).
 pinout:
-  # Inputs
-  ui[0]: ""
-  ui[1]: ""
-  ui[2]: ""
-  ui[3]: ""
-  ui[4]: ""
-  ui[5]: ""
-  ui[6]: ""
-  ui[7]: ""
+  # Inputs — 8-bit write data byte (MSB first)
+  ui[0]: "WR_DATA[0]"
+  ui[1]: "WR_DATA[1]"
+  ui[2]: "WR_DATA[2]"
+  ui[3]: "WR_DATA[3]"
+  ui[4]: "WR_DATA[4]"
+  ui[5]: "WR_DATA[5]"
+  ui[6]: "WR_DATA[6]"
+  ui[7]: "WR_DATA[7]"
 
-  # Outputs
-  uo[0]: "busy"
-  uo[1]: "done"
-  uo[2]: ""
-  uo[3]: ""
-  uo[4]: ""
-  uo[5]: ""
-  uo[6]: ""
-  uo[7]: ""
+  # Outputs — 8-bit read data byte (addressed register, byte selected)
+  uo[0]: "RD_DATA[0]"
+  uo[1]: "RD_DATA[1]"
+  uo[2]: "RD_DATA[2]"
+  uo[3]: "RD_DATA[3]"
+  uo[4]: "RD_DATA[4]"
+  uo[5]: "RD_DATA[5]"
+  uo[6]: "RD_DATA[6]"
+  uo[7]: "RD_DATA[7]"
 
-  # Bidirectional pins
-  uio[0]: "SCLK (SPI clock input)"
-  uio[1]: "MOSI (SPI data input)"
-  uio[2]: "MISO (SPI data output)"
-  uio[3]: "CS_N (SPI chip select, active low)"
-  uio[4]: ""
-  uio[5]: ""
-  uio[6]: ""
+  # Bidirectional pins (all configured as inputs)
+  uio[0]: "ADDR[0] (register address bit 0)"
+  uio[1]: "ADDR[1] (register address bit 1)"
+  uio[2]: "ADDR[2] (register address bit 2)"
+  uio[3]: "BYTE_SEL (0=MSB byte, 1=LSB byte)"
+  uio[4]: "WR_EN (write enable, rising-edge triggered)"
+  uio[5]: "SW_RST (software reset, active high level)"
+  uio[6]: "START (start trigger, rising-edge one-shot)"
   uio[7]: ""
 
 # Do not change!

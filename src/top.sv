@@ -4,19 +4,20 @@
 // INT16 Q8.8 fixed-point, 1D (scalar) state.
 //
 // Instantiates:
-//   u_spi  spi_slave     (interface.sv) — SPI register file, 8 registers
+//   u_par  par_reg       (interface.sv) — parallel GPIO register file
 //   u_core kalman_update (compute_core.sv) — 1D scalar Kalman update FSM
 //
 // Pin assignments:
-//   uio_in[0]  → SCLK (SPI clock)
-//   uio_in[1]  → MOSI (SPI data in)
-//   uio_out[2] → MISO (SPI data out)
-//   uio_in[3]  → CS_N (SPI chip select, active low)
-//   uio_oe     = 8'b0000_0100  (only bit 2 is output)
-//   uo_out[0]  = busy
-//   uo_out[1]  = done
-//   uo_out[7:2] = 6'b0
-//   ui_in       unused
+//   ui_in[7:0]  → wr_data[7:0]   write data byte
+//   uio_in[2:0] → addr[2:0]      register address
+//   uio_in[3]   → byte_sel       0=MSB byte, 1=LSB byte
+//   uio_in[4]   → wr_en          write enable (rising-edge triggered)
+//   uio_in[5]   → sw_rst_in      software reset (level)
+//   uio_in[6]   → start_in       start trigger (rising-edge one-shot)
+//   uio_in[7]   → (unused)
+//   uio_oe      = 8'h00           (all bidir pins configured as input)
+//   uio_out     = 8'h00
+//   uo_out[7:0] → rd_data[7:0]   read data byte (addressed register, byte selected)
 // =============================================================================
 module tt_um_joram200 (
     input  logic [7:0] ui_in,
@@ -29,15 +30,9 @@ module tt_um_joram200 (
     input  logic       rst_n
 );
 
-    // SPI signals
-    logic sclk, mosi, miso, cs_n;
-    assign sclk  = uio_in[0];
-    assign mosi  = uio_in[1];
-    assign cs_n  = uio_in[3];
-
-    // uio direction: only bit 2 (MISO) is driven by ASIC
-    assign uio_oe  = 8'b0000_0100;
-    assign uio_out = {5'b0, miso, 2'b0};
+    // All bidir pins are inputs (no MISO output)
+    assign uio_oe  = 8'h00;
+    assign uio_out = 8'h00;
 
     // Core control / status wires
     logic        core_start, sw_rst_w;
@@ -51,14 +46,19 @@ module tt_um_joram200 (
     logic [15:0] x_out_w;
     logic [15:0] P_out_w;
 
-    // SPI slave
-    spi_slave u_spi (
+    // Read data byte from register file
+    logic [7:0]  rd_data_w;
+
+    // Parallel GPIO register file
+    par_reg u_par (
         .clk        (clk),
         .rst_n      (rst_n),
-        .sclk       (sclk),
-        .mosi       (mosi),
-        .cs_n       (cs_n),
-        .miso       (miso),
+        .wr_data    (ui_in),
+        .addr       (uio_in[2:0]),
+        .byte_sel   (uio_in[3]),
+        .wr_en      (uio_in[4]),
+        .sw_rst_in  (uio_in[5]),
+        .start_in   (uio_in[6]),
         .core_start (core_start),
         .sw_rst     (sw_rst_w),
         .z_reg      (z_w),
@@ -68,10 +68,11 @@ module tt_um_joram200 (
         .done       (core_done),
         .busy       (core_busy),
         .x_out      (x_out_w),
-        .P_out      (P_out_w)
+        .P_out      (P_out_w),
+        .rd_data    (rd_data_w)
     );
 
-    // Kalman update core; soft-reset via sw_rst from SPI slave
+    // Kalman update core; soft-reset via sw_rst from register file
     kalman_update u_core (
         .clk       (clk),
         .rst_n     (rst_n & ~sw_rst_w),
@@ -86,13 +87,13 @@ module tt_um_joram200 (
         .busy      (core_busy)
     );
 
-    // Status outputs
-    assign uo_out = {6'b0, core_done, core_busy};
+    // Read data byte drives all output pins
+    assign uo_out = rd_data_w;
 
-    // Suppress unused port warning
+    // Suppress unused port warnings
     logic _ena_unused;
     assign _ena_unused = ena;
-    logic [7:0] _ui_unused;
-    assign _ui_unused = ui_in;
+    logic _uio7_unused;
+    assign _uio7_unused = uio_in[7];
 
 endmodule
