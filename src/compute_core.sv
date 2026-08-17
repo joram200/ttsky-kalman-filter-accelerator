@@ -1,36 +1,36 @@
 `timescale 1ns/1ps
 // =============================================================================
 // compute_core.sv — F32 + Time-multiplexed compute core for tt_um_joram200
-// Task 6 (iteration 4): Bit-serial f32_mul to eliminate 24×24 combinational
-//   multiplier (~3 k cells) and replace with shift-add loop (~400 cells).
+// Task 6 (iteration 5+6): Rank-1 P update + NR 4→3 + f32_add_seq + state retention
 //
-// vs iter3: f32_mul module changed from 1-cycle combinational to a 26-cycle
-//   sequential shift-and-add implementation.  The kalman_update FSM now stalls
-//   in multiply-bound states until mul_done_w is asserted.  f32_add remains
-//   combinational (adder area is small).
-//
-// Timing (approx, at 50 MHz):
-//   NR×4: ~220 cyc; K/KY_COMP: 81 cyc each; GEMM: ~703 cyc → ~1100 cyc total
-//   1100 / 50e6 = 22 µs — well within the SPI transfer window (~300 µs).
+// vs iter4 (bit-serial f32_mul_seq):
+//   - GEMM_INIT + GEMM_COMPUTE (27-MAC) replaced by P_UPDATE (9-MAC rank-1)
+//     P_new[i,j] = P[i,j] - K[i]*P[0,j]  (H=[1,0,0] simplification)
+//     Eliminates: ikha_elem 9:1 mux, pb_elem 9:1→3:1, acc_elem 9:1 mux,
+//                 IKH_arr, one_minus_k0_r, k_cnt, GEMM_INIT state
+//   - NR reduced 4→2 iterations (seed gives 8-bit acc; NR1 completes 32-bit)
+//   - f32_add (combinational barrel-shifter) → f32_add_seq (shift-by-1,
+//     variable latency 3..49 cycles); eliminates 24-bit barrel shifter and
+//     25-bit combinational adder.
+//   - Both mul and add now use start/done handshake; FSM stalls on both.
+//   - two_m_sx_r register isolates NR dependency (add result for mul_b).
 //
 // Module hierarchy:
-//   f32_mul_seq   — 1 instance: bit-serial 26-cycle multiplier
-//   f32_add       — 1 instance: combinational adder (unchanged)
-//   kalman_update — FSM with inlined GEMM, mul handshake
+//   f32_mul_seq   — bit-serial 26-cycle multiplier (unchanged)
+//   f32_add_seq   — shift-by-1 adder, variable latency
+//   kalman_update — FSM with rank-1 P_UPDATE replacing GEMM
 //
-// FSM (state durations with sequential mul):
-//   IDLE → S_COMP(2) → NR0..NR3(~55 cyc each) → K_COMP(81) → KY_COMP(81)
-//   → X_ADD(4) → GEMM_INIT(1) → GEMM_COMPUTE(703) → DONE_S(1) → IDLE
+// FSM states: IDLE→S_COMP→NR0→NR1→NR2→K_COMP→KY_COMP→X_ADD→P_UPDATE→DONE_S
+//
+// iter6 adds state retention: x_in_arr[3] + p_in_arr[9] stored on-chip.
+//   DONE_S captures x_out_arr→x_reg, acc→p_reg (for next update).
+//   Write-event ports (x_wr_en/idx/val, p_wr_en/idx/val) allow the SPI
+//   interface to initialise x_reg and p_reg before the first update.
+//   x_in and P_in input ports are removed; core reads from x_reg and p_reg.
 // =============================================================================
 
 // -----------------------------------------------------------------------------
-// f32_mul_seq — Sequential IEEE-754 single-precision multiplier (shift-and-add)
-//
-// Latency: 26 clock cycles from start to done.
-//   Cycle 0      : start=1; capture inputs; init shift registers.
-//   Cycles 1..24 : 24 shift-add steps (LSB-first of a_man).
-//   Cycle 25     : normalize & register result; assert done for 1 cycle.
-//   Cycle 26     : done=1, result valid.
+// f32_mul_seq — Sequential IEEE-754 F32 multiplier (26-cycle, unchanged)
 // -----------------------------------------------------------------------------
 module f32_mul_seq (
     input  logic        clk,
@@ -41,24 +41,19 @@ module f32_mul_seq (
     output logic [31:0] result,
     output logic        done
 );
-
-    // Registered per-operation flags / exponent (captured on start)
     logic        r_sign_r;
     logic signed [9:0] exp_sum_r;
     logic        a_nan_r, b_nan_r, a_inf_r, b_inf_r, a_zero_r, b_zero_r;
 
-    // Shift-add datapath
-    logic [47:0] accum;       // running product accumulator
-    logic [47:0] b_shifted;   // b_man shifted left each cycle
-    logic [23:0] a_shifted;   // a_man shifted right each cycle (LSB tested)
-    logic [4:0]  bit_cnt;     // 0..24 (0..23 = shift-add; 24 = normalize)
+    logic [47:0] accum;
+    logic [47:0] b_shifted;
+    logic [23:0] a_shifted;
+    logic [4:0]  bit_cnt;
     logic        busy;
 
-    // Combinational next-accumulator (used during shift-add cycles)
     logic [47:0] new_accum;
     assign new_accum = a_shifted[0] ? (accum + b_shifted) : accum;
 
-    // Combinational normalize (used on bit_cnt==24, reading registered accum)
     logic [22:0]       norm_man;
     logic signed [9:0] norm_exp;
     logic [31:0]       final_result;
@@ -85,196 +80,273 @@ module f32_mul_seq (
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            busy      <= 1'b0;
-            done      <= 1'b0;
-            result    <= 32'h0;
-            bit_cnt   <= 5'd0;
-            accum     <= 48'h0;
-            b_shifted <= 48'h0;
-            a_shifted <= 24'h0;
-            r_sign_r  <= 1'b0;
-            exp_sum_r <= 10'h0;
-            a_nan_r   <= 1'b0; b_nan_r  <= 1'b0;
-            a_inf_r   <= 1'b0; b_inf_r  <= 1'b0;
-            a_zero_r  <= 1'b0; b_zero_r <= 1'b0;
+            busy <= 1'b0; done <= 1'b0; result <= 32'h0; bit_cnt <= 5'd0;
+            accum <= 48'h0; b_shifted <= 48'h0; a_shifted <= 24'h0;
+            r_sign_r <= 1'b0; exp_sum_r <= 10'h0;
+            a_nan_r <= 1'b0; b_nan_r <= 1'b0; a_inf_r <= 1'b0;
+            b_inf_r <= 1'b0; a_zero_r <= 1'b0; b_zero_r <= 1'b0;
         end else begin
-            done <= 1'b0;  // default: deassert
-
+            done <= 1'b0;
             if (start && !busy) begin
-                // Capture sign, exponent sum, special-case flags
                 r_sign_r  <= a[31] ^ b[31];
-                exp_sum_r <= $signed({2'b00, a[30:23]})
-                           + $signed({2'b00, b[30:23]})
-                           - $signed(10'd127);
-                a_nan_r   <= (a[30:23] == 8'hFF) && (a[22:0] != 23'h0);
-                b_nan_r   <= (b[30:23] == 8'hFF) && (b[22:0] != 23'h0);
-                a_inf_r   <= (a[30:23] == 8'hFF) && (a[22:0] == 23'h0);
-                b_inf_r   <= (b[30:23] == 8'hFF) && (b[22:0] == 23'h0);
-                a_zero_r  <= (a[30:23] == 8'h0)  && (a[22:0] == 23'h0);
-                b_zero_r  <= (b[30:23] == 8'h0)  && (b[22:0] == 23'h0);
-                // Initialise shift registers with implicit-1 mantissas
-                a_shifted <= (a[30:23] == 8'h0) ? {1'b0, a[22:0]} : {1'b1, a[22:0]};
-                b_shifted <= {24'b0, ((b[30:23] == 8'h0) ? {1'b0, b[22:0]} : {1'b1, b[22:0]})};
-                accum     <= 48'h0;
-                bit_cnt   <= 5'd0;
-                busy      <= 1'b1;
-
+                exp_sum_r <= $signed({2'b00, a[30:23]}) + $signed({2'b00, b[30:23]})
+                             - $signed(10'd127);
+                a_nan_r  <= (a[30:23]==8'hFF) && (a[22:0]!=23'h0);
+                b_nan_r  <= (b[30:23]==8'hFF) && (b[22:0]!=23'h0);
+                a_inf_r  <= (a[30:23]==8'hFF) && (a[22:0]==23'h0);
+                b_inf_r  <= (b[30:23]==8'hFF) && (b[22:0]==23'h0);
+                a_zero_r <= (a[30:23]==8'h0)  && (a[22:0]==23'h0);
+                b_zero_r <= (b[30:23]==8'h0)  && (b[22:0]==23'h0);
+                a_shifted <= (a[30:23]==8'h0) ? {1'b0,a[22:0]} : {1'b1,a[22:0]};
+                b_shifted <= {24'b0, ((b[30:23]==8'h0) ? {1'b0,b[22:0]} : {1'b1,b[22:0]})};
+                accum <= 48'h0; bit_cnt <= 5'd0; busy <= 1'b1;
             end else if (busy) begin
                 if (bit_cnt < 5'd24) begin
-                    // Shift-and-add step
                     accum     <= new_accum;
-                    b_shifted <= {b_shifted[46:0], 1'b0};  // shift b_man left
-                    a_shifted <= {1'b0, a_shifted[23:1]};   // shift a_man right
+                    b_shifted <= {b_shifted[46:0], 1'b0};
+                    a_shifted <= {1'b0, a_shifted[23:1]};
                     bit_cnt   <= bit_cnt + 5'd1;
                 end else begin
-                    // bit_cnt == 24: accum holds complete product — normalise
-                    result  <= final_result;
-                    done    <= 1'b1;
-                    busy    <= 1'b0;
-                    bit_cnt <= 5'd0;
+                    result <= final_result; done <= 1'b1; busy <= 1'b0; bit_cnt <= 5'd0;
                 end
             end
         end
     end
-
 endmodule
 
 // -----------------------------------------------------------------------------
-// f32_add — Combinational IEEE-754 single-precision adder/subtractor
-// (unchanged from iter3)
+// f32_add_seq — Sequential IEEE-754 F32 adder (variable latency, shift-by-1)
+//
+// Latency (cycles from start to done visible):
+//   Special case (nan/inf/zero): 1 cycle
+//   Normal, shift_amt=N, norm_shifts=M: 1(idle→align) + N(align) + 1(add) + M(norm)
+//   Minimum: 2 cycles (shift=0, no norm); Maximum: ~49 cycles (shift=23, norm=23)
+//
+// Handshake: start pulses 1 cycle; done pulses 1 cycle; result valid when done=1.
 // -----------------------------------------------------------------------------
-module f32_add (
+module f32_add_seq (
+    input  logic        clk,
+    input  logic        rst_n,
+    input  logic        start,
     input  logic [31:0] a,
     input  logic [31:0] b,
-    output logic [31:0] result
+    output logic [31:0] result,
+    output logic        done
 );
 
-    logic        a_sign, b_sign;
-    logic [7:0]  a_exp,  b_exp;
-    logic [22:0] a_frac, b_frac;
+    // Internal states
+    typedef enum logic [1:0] {
+        FADD_IDLE  = 2'd0,
+        FADD_ALIGN = 2'd1,
+        FADD_ADD   = 2'd2,
+        FADD_NORM  = 2'd3
+    } fadd_st_t;
+    fadd_st_t add_st;
 
-    assign a_sign = a[31];
-    assign b_sign = b[31];
-    assign a_exp  = a[30:23];
-    assign b_exp  = b[30:23];
-    assign a_frac = a[22:0];
-    assign b_frac = b[22:0];
+    // Registered at start
+    logic        r_sign_r;        // result sign = big operand sign
+    logic        eff_sub_r;       // effective subtraction flag
+    logic [7:0]  big_exp_r;       // exponent of larger operand
+    logic [23:0] big_man_r;       // mantissa of larger (with implicit 1)
+    logic [23:0] sml_man_r;       // mantissa of smaller — right-shifted each ALIGN cycle
+    logic [4:0]  align_cnt_r;     // alignment shift counter (counts down to 0)
+    logic        is_special_r;    // any special-case applies
+    logic [31:0] spec_result_r;   // precomputed special-case result
 
-    logic a_nan, b_nan, a_inf, b_inf, a_zero, b_zero;
-    assign a_nan  = (a_exp == 8'hFF) && (a_frac != 23'h0);
-    assign b_nan  = (b_exp == 8'hFF) && (b_frac != 23'h0);
-    assign a_inf  = (a_exp == 8'hFF) && (a_frac == 23'h0);
-    assign b_inf  = (b_exp == 8'hFF) && (b_frac == 23'h0);
-    assign a_zero = (a_exp == 8'h0)  && (a_frac == 23'h0);
-    assign b_zero = (b_exp == 8'h0)  && (b_frac == 23'h0);
+    // After FADD_ADD
+    logic [24:0] sum_raw_r;       // full addition result (25 bits)
+    logic [8:0]  res_exp_r;       // current exponent during normalization
 
-    logic        big_sign, sml_sign;
-    logic [7:0]  big_exp,  sml_exp;
-    logic [23:0] big_man,  sml_man;
-    logic        do_swap;
-
-    always_comb begin
-        if (a_exp > b_exp) begin
-            do_swap = 1'b0;
-        end else if (b_exp > a_exp) begin
-            do_swap = 1'b1;
-        end else begin
-            do_swap = (b_frac > a_frac);
-        end
-
-        if (do_swap) begin
-            big_sign = b_sign; big_exp = b_exp;
-            big_man  = (b_exp == 8'h0) ? {1'b0, b_frac} : {1'b1, b_frac};
-            sml_sign = a_sign; sml_exp = a_exp;
-            sml_man  = (a_exp == 8'h0) ? {1'b0, a_frac} : {1'b1, a_frac};
-        end else begin
-            big_sign = a_sign; big_exp = a_exp;
-            big_man  = (a_exp == 8'h0) ? {1'b0, a_frac} : {1'b1, a_frac};
-            sml_sign = b_sign; sml_exp = b_exp;
-            sml_man  = (b_exp == 8'h0) ? {1'b0, b_frac} : {1'b1, b_frac};
-        end
-    end
-
-    logic [4:0]  shift_amt;
-    logic [23:0] sml_aligned;
-
-    assign shift_amt   = ((big_exp - sml_exp) > 8'd31) ? 5'd31 : big_exp[4:0] - sml_exp[4:0];
-    assign sml_aligned = sml_man >> shift_amt;
-
-    logic [24:0] sum_raw;
-    logic        eff_sub;
-    logic        r_sign;
+    // -------------------------------------------------------------------------
+    // Combinational inputs decode (used at start)
+    // -------------------------------------------------------------------------
+    logic        a_nan_c, b_nan_c, a_inf_c, b_inf_c, a_zero_c, b_zero_c;
+    logic        is_spec_c;
+    logic [31:0] spec_res_c;
+    logic        do_swap_c;
+    logic [7:0]  big_exp_c;
+    logic [23:0] big_man_c, sml_man_c;
+    logic [7:0]  exp_diff_c;
+    logic [4:0]  shift_amt_c;
 
     always_comb begin
-        eff_sub = big_sign ^ sml_sign;
-        r_sign  = big_sign;
-        if (!eff_sub) begin
-            sum_raw = {1'b0, big_man} + {1'b0, sml_aligned};
+        a_nan_c  = (a[30:23]==8'hFF) && (a[22:0]!=23'h0);
+        b_nan_c  = (b[30:23]==8'hFF) && (b[22:0]!=23'h0);
+        a_inf_c  = (a[30:23]==8'hFF) && (a[22:0]==23'h0);
+        b_inf_c  = (b[30:23]==8'hFF) && (b[22:0]==23'h0);
+        a_zero_c = (a[30:23]==8'h0)  && (a[22:0]==23'h0);
+        b_zero_c = (b[30:23]==8'h0)  && (b[22:0]==23'h0);
+        is_spec_c = a_nan_c || b_nan_c || a_inf_c || b_inf_c || a_zero_c || b_zero_c;
+
+        // Special-case result
+        if (a_nan_c || b_nan_c)
+            spec_res_c = 32'h7FC0_0000;
+        else if (a_inf_c && b_inf_c && (a[31] != b[31]))
+            spec_res_c = 32'h7FC0_0000;
+        else if (a_inf_c || b_inf_c)
+            spec_res_c = a_inf_c ? a : b;
+        else if (a_zero_c && b_zero_c)
+            spec_res_c = 32'h0;
+        else if (a_zero_c)
+            spec_res_c = b;
+        else
+            spec_res_c = a;  // b_zero_c
+
+        // Big/small ordering
+        if (a[30:23] > b[30:23])       do_swap_c = 1'b0;
+        else if (b[30:23] > a[30:23])  do_swap_c = 1'b1;
+        else                           do_swap_c = (b[22:0] > a[22:0]);
+
+        if (do_swap_c) begin
+            big_exp_c = b[30:23];
+            big_man_c = (b[30:23]==8'h0) ? {1'b0,b[22:0]} : {1'b1,b[22:0]};
+            sml_man_c = (a[30:23]==8'h0) ? {1'b0,a[22:0]} : {1'b1,a[22:0]};
+            exp_diff_c = b[30:23] - a[30:23];
         end else begin
-            sum_raw = {1'b0, big_man} - {1'b0, sml_aligned};
+            big_exp_c = a[30:23];
+            big_man_c = (a[30:23]==8'h0) ? {1'b0,a[22:0]} : {1'b1,a[22:0]};
+            sml_man_c = (b[30:23]==8'h0) ? {1'b0,b[22:0]} : {1'b1,b[22:0]};
+            exp_diff_c = a[30:23] - b[30:23];
         end
+        shift_amt_c = (exp_diff_c > 8'd23) ? 5'd23 : exp_diff_c[4:0];
     end
 
-    logic [8:0]  res_exp;
-    logic [22:0] res_man;
-    logic [23:0] shifted;
-
-    logic [4:0] lz_count;
-    always_comb begin : lz_encoder
-        lz_count = 5'd24;
-        for (int i = 0; i <= 23; i++) begin
-            if (sum_raw[i]) lz_count = 5'(23 - i);
-        end
+    // -------------------------------------------------------------------------
+    // Combinational: the 25-bit add/sub result (used in FADD_ADD state)
+    // -------------------------------------------------------------------------
+    logic [24:0] fadd_sum;
+    always_comb begin
+        if (!eff_sub_r)
+            fadd_sum = {1'b0, big_man_r} + {1'b0, sml_man_r};
+        else
+            fadd_sum = {1'b0, big_man_r} - {1'b0, sml_man_r};
     end
 
-    assign shifted  = sum_raw[23:0] << lz_count;
-    assign res_exp  = sum_raw[24] ? ({1'b0, big_exp} + 9'd1)           :
-                      sum_raw[23] ? {1'b0, big_exp}                      :
-                                    ({1'b0, big_exp} - {4'b0, lz_count});
-    assign res_man  = sum_raw[24] ? sum_raw[23:1]  :
-                      sum_raw[23] ? sum_raw[22:0]  :
-                                    shifted[22:0];
+    // -------------------------------------------------------------------------
+    // Sequential state machine
+    // -------------------------------------------------------------------------
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            add_st        <= FADD_IDLE;
+            done          <= 1'b0;
+            result        <= 32'h0;
+            r_sign_r      <= 1'b0;
+            eff_sub_r     <= 1'b0;
+            big_exp_r     <= 8'h0;
+            big_man_r     <= 24'h0;
+            sml_man_r     <= 24'h0;
+            align_cnt_r   <= 5'h0;
+            sum_raw_r     <= 25'h0;
+            res_exp_r     <= 9'h0;
+            is_special_r  <= 1'b0;
+            spec_result_r <= 32'h0;
+        end else begin
+            done <= 1'b0;  // default: deasserted
 
-    assign result =
-        (a_nan || b_nan)                          ? 32'h7FC0_0000           :
-        (a_inf && b_inf && (a_sign != b_sign))    ? 32'h7FC0_0000           :
-        (a_inf || b_inf)                          ? (a_inf ? a : b)         :
-        (a_zero && b_zero)                        ? 32'h0                   :
-        a_zero                                    ? b                       :
-        b_zero                                    ? a                       :
-        (sum_raw == 25'h0)                        ? 32'h0                   :
-        (res_exp[8] || (res_exp == 9'h0))         ? {r_sign, 31'b0}         :
-        (res_exp >= 9'h0FF)                       ? {r_sign, 8'hFF, 23'h0}  :
-                                                    {r_sign, res_exp[7:0], res_man};
+            case (add_st)
+
+                FADD_IDLE: begin
+                    if (start) begin
+                        if (is_spec_c) begin
+                            // Immediate output for special cases (1-cycle latency)
+                            result <= spec_res_c;
+                            done   <= 1'b1;
+                            // add_st stays FADD_IDLE
+                        end else begin
+                            // Capture for normal operation
+                            r_sign_r    <= do_swap_c ? b[31] : a[31];
+                            eff_sub_r   <= a[31] ^ b[31];  // always XOR of signs
+                            big_exp_r   <= big_exp_c;
+                            big_man_r   <= big_man_c;
+                            sml_man_r   <= sml_man_c;
+                            align_cnt_r <= shift_amt_c;
+                            add_st      <= FADD_ALIGN;
+                        end
+                        // Also register spec info in case needed later
+                        is_special_r  <= is_spec_c;
+                        spec_result_r <= spec_res_c;
+                    end
+                end
+
+                FADD_ALIGN: begin
+                    if (align_cnt_r == 5'h0) begin
+                        // Alignment complete — proceed to addition
+                        add_st <= FADD_ADD;
+                    end else begin
+                        sml_man_r   <= {1'b0, sml_man_r[23:1]};  // right-shift 1 bit
+                        align_cnt_r <= align_cnt_r - 5'd1;
+                    end
+                end
+
+                FADD_ADD: begin
+                    // fadd_sum computed combinationally from big_man_r/sml_man_r/eff_sub_r
+                    if (fadd_sum == 25'h0) begin
+                        result <= 32'h0;
+                        done   <= 1'b1;
+                        add_st <= FADD_IDLE;
+                    end else if (fadd_sum[24]) begin
+                        // Carry out: right-shift by 1, exp+1
+                        if (big_exp_r == 8'hFE) begin
+                            result <= {r_sign_r, 8'hFF, 23'h0};  // overflow → inf
+                        end else begin
+                            result <= {r_sign_r, big_exp_r + 8'd1, fadd_sum[23:1]};
+                        end
+                        done   <= 1'b1;
+                        add_st <= FADD_IDLE;
+                    end else if (fadd_sum[23]) begin
+                        // Already normalized
+                        result <= {r_sign_r, big_exp_r, fadd_sum[22:0]};
+                        done   <= 1'b1;
+                        add_st <= FADD_IDLE;
+                    end else begin
+                        // Need left-shifts to normalize
+                        sum_raw_r <= fadd_sum;
+                        res_exp_r <= {1'b0, big_exp_r};
+                        add_st    <= FADD_NORM;
+                    end
+                end
+
+                FADD_NORM: begin
+                    if (sum_raw_r[23] || res_exp_r == 9'h0) begin
+                        // Normalized or exponent underflow → output
+                        result <= (res_exp_r == 9'h0) ? {r_sign_r, 31'b0}
+                                                      : {r_sign_r, res_exp_r[7:0], sum_raw_r[22:0]};
+                        done   <= 1'b1;
+                        add_st <= FADD_IDLE;
+                    end else begin
+                        sum_raw_r <= {sum_raw_r[23:0], 1'b0};  // left-shift
+                        res_exp_r <= res_exp_r - 9'd1;
+                    end
+                end
+
+                default: add_st <= FADD_IDLE;
+            endcase
+        end
+    end
 
 endmodule
 
 // -----------------------------------------------------------------------------
-// kalman_update — Kalman filter update with inlined 3×3 GEMM (F32, iter4)
+// kalman_update — Kalman filter update (F32, iter5)
 // H = [1, 0, 0] (scalar measurement)
 //
-// Single shared f32_mul_seq (sequential) and f32_add (combinational).
+// P covariance update uses rank-1 formula:
+//   P_new[i,j] = P[i,j] - K[i] * P[0,j]   for i,j ∈ {0,1,2}
+// This replaces the full 27-MAC GEMM with 9 independent MACs.
 //
-// Multiply handshake:
-//   mul_start_w  — combinational pulse: asserted for exactly 1 cycle when
-//                  the FSM is in a mul-needing state and mul_active=0.
-//   mul_active   — registered: set on mul_start_w, cleared on mul_done_w.
-//   mul_done_w   — from f32_mul_seq: 1-cycle pulse 26 cycles after start.
-//   mul_result   — from f32_mul_seq: valid when mul_done_w=1.
+// Arithmetic: 1 shared f32_mul_seq + 1 shared f32_add_seq.
+//   Both have start/done handshake; FSM stalls until each completes.
 //
-// States that stall until mul_done_w:
-//   NR0..NR3  sub_cnt 0 (first mul S*nr_x) and sub_cnt 2 (second mul nr_x*(2-sx))
-//   K_COMP    sub_cnt 0, 1, 2 (one mul per K element)
-//   KY_COMP   sub_cnt 0, 1, 2 (one mul per ky element)
-//   GEMM_COMPUTE (one mul per MAC, k/i/j advance on mul_done_w)
+// FSM states (9):
+//   IDLE → S_COMP → NR0 → NR1 → K_COMP → KY_COMP → X_ADD → P_UPDATE → DONE_S
 // -----------------------------------------------------------------------------
 module kalman_update (
     input  logic        clk,
     input  logic        rst_n,
     input  logic        start,
     input  logic [31:0]  z,
-    input  logic [95:0]  x_in,
-    input  logic [287:0] P_in,
+    input  logic [95:0]  x_in,      // 3×32 prior state
+    input  logic [287:0] P_in,      // 9×32 prior covariance
     input  logic [31:0]  r_val,
     output logic [95:0]  x_out,
     output logic [287:0] P_out,
@@ -283,42 +355,35 @@ module kalman_update (
 );
 
     localparam logic [31:0] F32_TWO = 32'h4000_0000;
-    localparam logic [31:0] F32_ONE = 32'h3F80_0000;
 
-    // -------------------------------------------------------------------------
-    // FSM states
-    // -------------------------------------------------------------------------
     typedef enum logic [3:0] {
-        IDLE         = 4'd0,
-        S_COMP       = 4'd1,   // 2 sub: y_tilde, then S+r seed
-        NR0          = 4'd2,   // NR iteration 0 (3 sub-cycles with mul stalls)
-        NR1          = 4'd3,
-        NR2          = 4'd4,
-        NR3          = 4'd5,
-        K_COMP       = 4'd6,   // 3 sub-cycles, each stalls until mul_done
-        KY_COMP      = 4'd7,
-        X_ADD        = 4'd8,   // 4 sub cycles (adder only)
-        GEMM_INIT    = 4'd9,
-        GEMM_COMPUTE = 4'd10,  // 27 MACs, each stalls until mul_done
-        DONE_S       = 4'd11
+        IDLE     = 4'd0,
+        S_COMP   = 4'd1,
+        NR0      = 4'd2,
+        NR1      = 4'd3,
+        NR2      = 4'd9,
+        K_COMP   = 4'd4,
+        KY_COMP  = 4'd5,
+        X_ADD    = 4'd6,
+        P_UPDATE = 4'd7,
+        DONE_S   = 4'd8
     } state_t;
 
     state_t state, state_nxt;
     logic [1:0] sub_cnt, sub_nxt;
 
     // -------------------------------------------------------------------------
-    // Unpack flat input ports to wire arrays
+    // Unpack flat input ports to internal arrays
     // -------------------------------------------------------------------------
     logic [31:0] x_in_arr [0:2];
-    logic [31:0] P_in_arr [0:8];
-
-    genvar ku;
+    logic [31:0] p_in_arr [0:8];
+    genvar ki;
     generate
-        for (ku = 0; ku < 3; ku++) begin : unpack_xin
-            assign x_in_arr[ku] = x_in[ku*32 +: 32];
+        for (ki = 0; ki < 3; ki++) begin : unpack_xin
+            assign x_in_arr[ki] = x_in[ki*32 +: 32];
         end
-        for (ku = 0; ku < 9; ku++) begin : unpack_pin
-            assign P_in_arr[ku] = P_in[ku*32 +: 32];
+        for (ki = 0; ki < 9; ki++) begin : unpack_pin
+            assign p_in_arr[ki] = P_in[ki*32 +: 32];
         end
     endgenerate
 
@@ -326,6 +391,7 @@ module kalman_update (
     // Output packing
     // -------------------------------------------------------------------------
     logic [31:0] x_out_arr [0:2];
+    genvar ku;
     generate
         for (ku = 0; ku < 3; ku++) begin : pack_xout
             assign x_out[ku*32 +: 32] = x_out_arr[ku];
@@ -340,156 +406,134 @@ module kalman_update (
     endgenerate
 
     // -------------------------------------------------------------------------
-    // Registered intermediate values
+    // Intermediate registers
     // -------------------------------------------------------------------------
-    logic [31:0] y_tilde;
-    logic [31:0] S_reg;
-    logic [31:0] S_inv;
-    logic [31:0] nr_x;
-    logic [31:0] sx_reg;
-    logic [31:0] K_reg [0:2];
-    logic [31:0] ky_arr [0:2];
-    logic [31:0] one_minus_k0_r;
+    logic [31:0] y_tilde;         // z - x_in[0]
+    logic [31:0] S_reg;           // P_in[0] + r_val
+    logic [31:0] S_inv;           // 1/S via Newton-Raphson
+    logic [31:0] nr_x;            // NR iterate
+    logic [31:0] sx_reg;          // S * nr_x (NR intermediate)
+    logic [31:0] two_m_sx_r;      // 2 - sx_reg  (NR sub1 add result, fed to sub2 mul)
+    logic [31:0] K_reg [0:2];     // Kalman gain K[i] = P[i*3] * S_inv
+    logic [31:0] ky_arr [0:2];    // K[i] * y_tilde
 
-    // GEMM counters: k outer (0..2), i middle (0..2), j inner (0..2)
-    logic [1:0] k_cnt, i_cnt, j_cnt;
-
-    // -------------------------------------------------------------------------
-    // IKH matrix (combinational from K_reg)
-    // -------------------------------------------------------------------------
-    logic [31:0] IKH_arr [0:8];
-    assign IKH_arr[0] = one_minus_k0_r;
-    assign IKH_arr[1] = 32'h0;
-    assign IKH_arr[2] = 32'h0;
-    assign IKH_arr[3] = {~K_reg[1][31], K_reg[1][30:0]};
-    assign IKH_arr[4] = F32_ONE;
-    assign IKH_arr[5] = 32'h0;
-    assign IKH_arr[6] = {~K_reg[2][31], K_reg[2][30:0]};
-    assign IKH_arr[7] = 32'h0;
-    assign IKH_arr[8] = F32_ONE;
+    // P_UPDATE counters: j fastest, then i
+    logic [1:0] i_cnt, j_cnt;
+    logic       pu_last;
+    assign pu_last = (i_cnt == 2'd2) && (j_cnt == 2'd2);
 
     // -------------------------------------------------------------------------
-    // GEMM index computation
+    // 9-to-1 mux: p_in_arr[i*3+j]  (add_a in P_UPDATE)
     // -------------------------------------------------------------------------
-    logic [3:0] ikha_idx, pb_idx, acc_idx;
-    assign ikha_idx = {2'b0, i_cnt} * 4'd3 + {2'b0, k_cnt};
-    assign pb_idx   = {2'b0, k_cnt} * 4'd3 + {2'b0, j_cnt};
-    assign acc_idx  = {2'b0, i_cnt} * 4'd3 + {2'b0, j_cnt};
-
-    logic [31:0] ikha_elem, pb_elem;
+    logic [31:0] p_in_elem;
     always_comb begin
-        case (ikha_idx)
-            4'd0: ikha_elem = IKH_arr[0]; 4'd1: ikha_elem = IKH_arr[1];
-            4'd2: ikha_elem = IKH_arr[2]; 4'd3: ikha_elem = IKH_arr[3];
-            4'd4: ikha_elem = IKH_arr[4]; 4'd5: ikha_elem = IKH_arr[5];
-            4'd6: ikha_elem = IKH_arr[6]; 4'd7: ikha_elem = IKH_arr[7];
-            4'd8: ikha_elem = IKH_arr[8];
-            default: ikha_elem = 32'h0;
-        endcase
-    end
-    always_comb begin
-        case (pb_idx)
-            4'd0: pb_elem = P_in_arr[0]; 4'd1: pb_elem = P_in_arr[1];
-            4'd2: pb_elem = P_in_arr[2]; 4'd3: pb_elem = P_in_arr[3];
-            4'd4: pb_elem = P_in_arr[4]; 4'd5: pb_elem = P_in_arr[5];
-            4'd6: pb_elem = P_in_arr[6]; 4'd7: pb_elem = P_in_arr[7];
-            4'd8: pb_elem = P_in_arr[8];
-            default: pb_elem = 32'h0;
-        endcase
-    end
-    logic [31:0] acc_elem;
-    always_comb begin
-        case (acc_idx)
-            4'd0: acc_elem = acc[0]; 4'd1: acc_elem = acc[1];
-            4'd2: acc_elem = acc[2]; 4'd3: acc_elem = acc[3];
-            4'd4: acc_elem = acc[4]; 4'd5: acc_elem = acc[5];
-            4'd6: acc_elem = acc[6]; 4'd7: acc_elem = acc[7];
-            4'd8: acc_elem = acc[8];
-            default: acc_elem = 32'h0;
+        case ({i_cnt, j_cnt})
+            4'b0000: p_in_elem = p_in_arr[0];
+            4'b0001: p_in_elem = p_in_arr[1];
+            4'b0010: p_in_elem = p_in_arr[2];
+            4'b0100: p_in_elem = p_in_arr[3];
+            4'b0101: p_in_elem = p_in_arr[4];
+            4'b0110: p_in_elem = p_in_arr[5];
+            4'b1000: p_in_elem = p_in_arr[6];
+            4'b1001: p_in_elem = p_in_arr[7];
+            4'b1010: p_in_elem = p_in_arr[8];
+            default: p_in_elem = 32'h0;
         endcase
     end
 
     // -------------------------------------------------------------------------
-    // Shared sequential multiplier + combinational adder
+    // Shared sequential multiplier and adder
     // -------------------------------------------------------------------------
-    logic [31:0] mul_a, mul_b;
-    logic        mul_start_w;
-    logic [31:0] mul_result;
-    logic        mul_done_w;
-    logic        mul_active;   // registered: 1 while mul is running
+    logic [31:0] mul_a, mul_b, mul_result;
+    logic        mul_start_w, mul_done_w, mul_active;
+
+    logic [31:0] add_a, add_b, add_result;
+    logic        add_start_w, add_done_w, add_active;
 
     f32_mul_seq u_shared_mul (
-        .clk(clk), .rst_n(rst_n),
-        .start(mul_start_w),
-        .a(mul_a), .b(mul_b),
-        .result(mul_result),
-        .done(mul_done_w)
+        .clk(clk), .rst_n(rst_n), .start(mul_start_w),
+        .a(mul_a), .b(mul_b), .result(mul_result), .done(mul_done_w)
+    );
+    f32_add_seq u_shared_add (
+        .clk(clk), .rst_n(rst_n), .start(add_start_w),
+        .a(add_a), .b(add_b), .result(add_result), .done(add_done_w)
     );
 
-    logic [31:0] shared_add_a, shared_add_b, shared_add_r;
-    f32_add u_shared_add (.a(shared_add_a), .b(shared_add_b), .result(shared_add_r));
-
-    // Newton-Raphson seed
+    // Newton-Raphson initial seed
     function automatic logic [31:0] nr_seed (input logic [31:0] s);
         nr_seed = 32'h7EF1_27EA - s;
     endfunction
 
     // -------------------------------------------------------------------------
-    // mul_start_w — combinational: start a multiply when state needs one
-    //   and no multiply is currently running.
-    //
-    // For NR states: fire on sub_cnt==0 (first mul S*nr_x) and sub_cnt==2
-    //   (second mul nr_x*(2-sx)), NOT on sub_cnt==1 (gap cycle for adder).
-    // For K_COMP, KY_COMP: fire on every sub_cnt when not active.
-    // For GEMM_COMPUTE: fire unless counters are at last-MAC position
-    //   AND that last MAC is already done (detected by mul_active transitioning
-    //   away).  Guard: only start if k/i/j not at final position or mul_active.
-    //   Simpler guard: don't start when all counters are at max AND !mul_active
-    //   (which means the last mul already fired and we're about to leave).
+    // mul_start_w
+    //   NR sub 0 and sub 2: multiply S*nr_x, then nr_x*(2-sx)
+    //   K_COMP, KY_COMP: one mul per sub_cnt
+    //   P_UPDATE: start each MAC when neither mul nor add is running
     // -------------------------------------------------------------------------
-    logic gemm_last;
-    assign gemm_last = (k_cnt == 2'd2) && (i_cnt == 2'd2) && (j_cnt == 2'd2);
-
     always_comb begin
         mul_start_w = 1'b0;
         if (!mul_active) begin
             case (state)
-                NR0, NR1, NR2, NR3:
+                NR0, NR1, NR2:
                     if (sub_cnt == 2'd0 || sub_cnt == 2'd2) mul_start_w = 1'b1;
-                K_COMP:    mul_start_w = 1'b1;
-                KY_COMP:   mul_start_w = 1'b1;
-                GEMM_COMPUTE:
-                    // Start every MAC including the last one (k=i=j=2).
-                    // Termination is in next-state: mul_done_w && gemm_last → DONE_S.
-                    mul_start_w = 1'b1;
+                K_COMP:  mul_start_w = 1'b1;
+                KY_COMP: mul_start_w = 1'b1;
+                P_UPDATE:
+                    // Don't start a new mul while add is running or if both are idle
+                    // after the last MAC (handled by termination in next-state)
+                    if (!add_active) mul_start_w = 1'b1;
                 default: ;
             endcase
         end
     end
 
     // -------------------------------------------------------------------------
-    // mul_a / mul_b mux
+    // add_start_w
+    //   S_COMP: each sub-cycle is one add
+    //   NR sub 1: add(F32_TWO, -sx_reg) = 2-sx
+    //   X_ADD: each sub-cycle is one add
+    //   P_UPDATE: add fires immediately after mul_done_w
+    // -------------------------------------------------------------------------
+    always_comb begin
+        add_start_w = 1'b0;
+        if (!add_active) begin
+            case (state)
+                S_COMP:
+                    if (sub_cnt == 2'd0 || sub_cnt == 2'd1) add_start_w = 1'b1;
+                NR0, NR1, NR2:
+                    if (sub_cnt == 2'd1) add_start_w = 1'b1;
+                X_ADD:
+                    if (sub_cnt == 2'd0 || sub_cnt == 2'd1 || sub_cnt == 2'd2)
+                        add_start_w = 1'b1;
+                P_UPDATE:
+                    // Triggered by mul_done_w (not just !add_active alone)
+                    if (mul_done_w) add_start_w = 1'b1;
+                default: ;
+            endcase
+        end
+    end
+
+    // -------------------------------------------------------------------------
+    // mul_a / mul_b input mux
     // -------------------------------------------------------------------------
     always_comb begin
         mul_a = 32'h0;
         mul_b = 32'h0;
         case (state)
-            NR0, NR1, NR2, NR3: begin
+            NR0, NR1, NR2: begin
                 if (sub_cnt == 2'd0) begin
-                    mul_a = S_reg;
-                    mul_b = nr_x;
+                    mul_a = S_reg; mul_b = nr_x;
                 end else begin
-                    // sub_cnt == 2: nr_x * (2 - sx_reg)
-                    mul_a = nr_x;
-                    mul_b = shared_add_r;   // F32_TWO - sx_reg (combinational)
+                    // sub_cnt==2: nr_x * (2-sx), using registered two_m_sx_r
+                    mul_a = nr_x; mul_b = two_m_sx_r;
                 end
             end
             K_COMP: begin
                 mul_b = S_inv;
                 case (sub_cnt)
-                    2'd0: mul_a = P_in_arr[0];
-                    2'd1: mul_a = P_in_arr[3];
-                    2'd2: mul_a = P_in_arr[6];
+                    2'd0: mul_a = p_in_arr[0];
+                    2'd1: mul_a = p_in_arr[3];
+                    2'd2: mul_a = p_in_arr[6];
                     default: mul_a = 32'h0;
                 endcase
             end
@@ -502,56 +546,58 @@ module kalman_update (
                     default: mul_a = 32'h0;
                 endcase
             end
-            GEMM_COMPUTE: begin
-                mul_a = ikha_elem;
-                mul_b = pb_elem;
+            P_UPDATE: begin
+                // K_reg[i] * p_in_arr[j]  (first row of P)
+                case (i_cnt)
+                    2'd0: mul_a = K_reg[0];
+                    2'd1: mul_a = K_reg[1];
+                    2'd2: mul_a = K_reg[2];
+                    default: mul_a = 32'h0;
+                endcase
+                case (j_cnt)
+                    2'd0: mul_b = p_in_arr[0];
+                    2'd1: mul_b = p_in_arr[1];
+                    2'd2: mul_b = p_in_arr[2];
+                    default: mul_b = 32'h0;
+                endcase
             end
             default: ;
         endcase
     end
 
     // -------------------------------------------------------------------------
-    // Shared adder mux
-    //   S_COMP sub 0 : z - x_in[0]
-    //   S_COMP sub 1 : P_in[0] + r_val
-    //   NR sub 1,2   : F32_TWO - sx_reg  (gap + mul-b capture cycle)
-    //   X_ADD        : x_in[i] + ky[i], then 1 - K[0]
-    //   GEMM_COMPUTE : acc_elem + mul_result  (valid on mul_done_w)
+    // add_a / add_b input mux
     // -------------------------------------------------------------------------
     always_comb begin
-        shared_add_a = 32'h0;
-        shared_add_b = 32'h0;
+        add_a = 32'h0;
+        add_b = 32'h0;
         case (state)
             S_COMP: begin
                 if (sub_cnt == 2'd0) begin
-                    shared_add_a = z;
-                    shared_add_b = {~x_in_arr[0][31], x_in_arr[0][30:0]};
+                    add_a = z;
+                    add_b = {~x_in_arr[0][31], x_in_arr[0][30:0]};  // z - x[0]
                 end else begin
-                    shared_add_a = P_in_arr[0];
-                    shared_add_b = r_val;
+                    add_a = p_in_arr[0];
+                    add_b = r_val;  // S = P[0,0] + R
                 end
             end
-            NR0, NR1, NR2, NR3: begin
-                // Sub_cnt 1 (gap) and sub_cnt 2 (mul start): adder = 2 - sx_reg
-                if (sub_cnt == 2'd1 || sub_cnt == 2'd2) begin
-                    shared_add_a = F32_TWO;
-                    shared_add_b = {~sx_reg[31], sx_reg[30:0]};
-                end
+            NR0, NR1, NR2: begin
+                // sub_cnt==1: 2.0 - sx_reg
+                add_a = F32_TWO;
+                add_b = {~sx_reg[31], sx_reg[30:0]};
             end
             X_ADD: begin
                 case (sub_cnt)
-                    2'd0: begin shared_add_a = x_in_arr[0]; shared_add_b = ky_arr[0]; end
-                    2'd1: begin shared_add_a = x_in_arr[1]; shared_add_b = ky_arr[1]; end
-                    2'd2: begin shared_add_a = x_in_arr[2]; shared_add_b = ky_arr[2]; end
-                    2'd3: begin
-                        shared_add_a = F32_ONE;
-                        shared_add_b = {~K_reg[0][31], K_reg[0][30:0]};
-                    end
+                    2'd0: begin add_a = x_in_arr[0]; add_b = ky_arr[0]; end
+                    2'd1: begin add_a = x_in_arr[1]; add_b = ky_arr[1]; end
+                    2'd2: begin add_a = x_in_arr[2]; add_b = ky_arr[2]; end
+                    default: ;
                 endcase
             end
-            GEMM_COMPUTE: begin
-                shared_add_a = acc_elem;
-                shared_add_b = mul_result;  // valid when mul_done_w=1
+            P_UPDATE: begin
+                // P[i,j] + (- K[i]*P[0,j])
+                add_a = p_in_elem;
+                add_b = {~mul_result[31], mul_result[30:0]};  // negate mul result
             end
             default: ;
         endcase
@@ -559,40 +605,46 @@ module kalman_update (
 
     // -------------------------------------------------------------------------
     // FSM next-state + sub_nxt
-    //
-    // States NR*, K_COMP, KY_COMP, GEMM_COMPUTE stall (sub_nxt = sub_cnt) while
-    // mul_active=1 and mul_done_w=0.
+    // Stall rules:
+    //   States using add: advance sub_cnt only on add_done_w
+    //   NR sub 0, sub 2: stall until mul_done_w
+    //   NR sub 1: stall until add_done_w
+    //   K_COMP, KY_COMP: stall each sub until mul_done_w
+    //   P_UPDATE: advance i/j on add_done_w; exit on pu_last && add_done_w
     // -------------------------------------------------------------------------
     always_comb begin
         state_nxt = state;
-        sub_nxt   = sub_cnt + 2'd1;  // default: advance sub_cnt
+        sub_nxt   = sub_cnt + 2'd1;  // default: advance
 
         case (state)
             IDLE:
                 if (start) begin state_nxt = S_COMP; sub_nxt = 2'd0; end
-                else             sub_nxt = 2'd0;
+                else sub_nxt = 2'd0;
 
-            S_COMP:
-                if (sub_cnt == 2'd1) begin state_nxt = NR0; sub_nxt = 2'd0; end
+            S_COMP: begin
+                // Each sub-cycle stalls on add
+                if (!add_done_w) sub_nxt = sub_cnt;
+                else if (sub_cnt == 2'd1) begin state_nxt = NR0; sub_nxt = 2'd0; end
+            end
 
-            NR0, NR1, NR2, NR3: begin
+            NR0, NR1, NR2: begin
                 if (sub_cnt == 2'd0) begin
-                    // First multiply: stall until done
+                    // First mul stall
                     if (!mul_done_w) sub_nxt = 2'd0;
                     // else sub_nxt = 1 (default)
                 end else if (sub_cnt == 2'd1) begin
-                    // Gap cycle: auto-advance to 2 (default)
+                    // Add stall (2-sx computation)
+                    if (!add_done_w) sub_nxt = 2'd1;
+                    // else sub_nxt = 2 (default)
                 end else begin
-                    // sub_cnt == 2: second multiply, stall until done
-                    if (!mul_done_w) begin
-                        sub_nxt = 2'd2;
-                    end else begin
+                    // sub_cnt == 2: second mul stall
+                    if (!mul_done_w) sub_nxt = 2'd2;
+                    else begin
                         sub_nxt = 2'd0;
                         case (state)
                             NR0: state_nxt = NR1;
                             NR1: state_nxt = NR2;
-                            NR2: state_nxt = NR3;
-                            NR3: state_nxt = K_COMP;
+                            NR2: state_nxt = K_COMP;
                             default: state_nxt = K_COMP;
                         endcase
                     end
@@ -600,7 +652,7 @@ module kalman_update (
             end
 
             K_COMP: begin
-                if (!mul_done_w) sub_nxt = sub_cnt;  // stall
+                if (!mul_done_w) sub_nxt = sub_cnt;
                 else if (sub_cnt == 2'd2) begin state_nxt = KY_COMP; sub_nxt = 2'd0; end
             end
 
@@ -609,15 +661,15 @@ module kalman_update (
                 else if (sub_cnt == 2'd2) begin state_nxt = X_ADD; sub_nxt = 2'd0; end
             end
 
-            X_ADD:
-                if (sub_cnt == 2'd3) begin state_nxt = GEMM_INIT; sub_nxt = 2'd0; end
+            X_ADD: begin
+                // 3 sub-cycles (sub 3 removed — one_minus_k0_r no longer needed)
+                if (!add_done_w) sub_nxt = sub_cnt;
+                else if (sub_cnt == 2'd2) begin state_nxt = P_UPDATE; sub_nxt = 2'd0; end
+            end
 
-            GEMM_INIT:
-                begin state_nxt = GEMM_COMPUTE; sub_nxt = 2'd0; end
-
-            GEMM_COMPUTE: begin
-                sub_nxt = 2'd0;  // sub_cnt unused here
-                if (mul_done_w && gemm_last) state_nxt = DONE_S;
+            P_UPDATE: begin
+                sub_nxt = 2'd0;
+                if (add_done_w && pu_last) state_nxt = DONE_S;
             end
 
             DONE_S: begin state_nxt = IDLE; sub_nxt = 2'd0; end
@@ -631,68 +683,65 @@ module kalman_update (
     integer ii;
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state    <= IDLE;
-            sub_cnt  <= 2'd0;
+            state     <= IDLE;
+            sub_cnt   <= 2'd0;
             mul_active <= 1'b0;
-            y_tilde  <= 32'h0;
-            S_reg    <= 32'h0;
-            S_inv    <= 32'h0;
-            nr_x     <= 32'h0;
-            sx_reg   <= 32'h0;
+            add_active <= 1'b0;
+            y_tilde   <= 32'h0;
+            S_reg     <= 32'h0;
+            S_inv     <= 32'h0;
+            nr_x      <= 32'h0;
+            sx_reg    <= 32'h0;
+            two_m_sx_r <= 32'h0;
             for (ii = 0; ii < 3; ii++) begin
                 K_reg[ii]     <= 32'h0;
                 ky_arr[ii]    <= 32'h0;
                 x_out_arr[ii] <= 32'h0;
             end
-            one_minus_k0_r <= 32'h0;
-            k_cnt <= 2'd0; i_cnt <= 2'd0; j_cnt <= 2'd0;
-            for (ii = 0; ii < 9; ii++) acc[ii] <= 32'h0;
+            i_cnt <= 2'd0; j_cnt <= 2'd0;
+            for (ii = 0; ii < 9; ii++) begin
+                acc[ii] <= 32'h0;
+            end
         end else begin
             state   <= state_nxt;
             sub_cnt <= sub_nxt;
 
-            // mul_active tracking
+            // Mul/add active tracking
             if (mul_start_w)  mul_active <= 1'b1;
             else if (mul_done_w) mul_active <= 1'b0;
 
+            if (add_start_w)  add_active <= 1'b1;
+            else if (add_done_w) add_active <= 1'b0;
+
             case (state)
 
-                // S_COMP: combinational adder only
+                // S_COMP: 2 add sub-cycles
+                // sub 0: y_tilde = z - x_in[0]
+                // sub 1: S_reg = P[0,0] + R; nr_x = NR seed
                 S_COMP: begin
-                    if (sub_cnt == 2'd0) begin
-                        y_tilde <= shared_add_r;
-                    end else begin
-                        S_reg <= shared_add_r;
-                        nr_x  <= nr_seed(shared_add_r);
+                    if (add_done_w) begin
+                        if (sub_cnt == 2'd0) begin
+                            y_tilde <= add_result;
+                        end else begin
+                            S_reg <= add_result;
+                            nr_x  <= nr_seed(add_result);
+                        end
                     end
                 end
 
-                // NR0..NR2: sub 0 → sx=S*nr_x on mul_done;
-                //           sub 1 → gap (adder computes 2-sx combinationally);
-                //           sub 2 → nr_x = nr_x*(2-sx) on mul_done
+                // NR0, NR1, NR2: sub 0 → sx=S*nr_x; sub 1 → two_m_sx=2-sx (add);
+                //                sub 2 → nr_x = nr_x*(2-sx)
                 NR0, NR1, NR2: begin
-                    if (mul_done_w) begin
-                        if (sub_cnt == 2'd0) begin
-                            sx_reg <= mul_result;
-                        end else begin  // sub_cnt == 2
-                            nr_x  <= mul_result;
-                            S_inv <= mul_result;
-                        end
+                    if (mul_done_w && sub_cnt == 2'd0) sx_reg <= mul_result;
+                    if (add_done_w && sub_cnt == 2'd1) two_m_sx_r <= add_result;
+                    if (mul_done_w && sub_cnt == 2'd2) begin
+                        S_inv <= mul_result;
+                        // NR0 and NR1 update nr_x for next iteration; NR2 is final
+                        if (state == NR0 || state == NR1) nr_x <= mul_result;
                     end
                 end
 
-                // NR3: final iteration — update S_inv but not nr_x
-                NR3: begin
-                    if (mul_done_w) begin
-                        if (sub_cnt == 2'd0) begin
-                            sx_reg <= mul_result;
-                        end else begin  // sub_cnt == 2
-                            S_inv <= mul_result;
-                        end
-                    end
-                end
-
-                // K_COMP: K[i] = P_in[i*3] * S_inv
+                // K_COMP: K[i] = P[i*3] * S_inv
                 K_COMP: begin
                     if (mul_done_w) begin
                         case (sub_cnt)
@@ -716,57 +765,54 @@ module kalman_update (
                     end
                 end
 
-                // X_ADD: combinational adder only
+                // X_ADD: 3 sub-cycles; x_out[i] = x_in[i] + ky[i]
+                //   (sub 3 removed — one_minus_k0_r no longer needed for rank-1)
                 X_ADD: begin
-                    case (sub_cnt)
-                        2'd0: x_out_arr[0] <= shared_add_r;
-                        2'd1: x_out_arr[1] <= shared_add_r;
-                        2'd2: x_out_arr[2] <= shared_add_r;
-                        2'd3: one_minus_k0_r <= shared_add_r;
-                    endcase
-                end
-
-                // GEMM_INIT: zero accumulators, reset counters
-                GEMM_INIT: begin
-                    for (ii = 0; ii < 9; ii++) acc[ii] <= 32'h0;
-                    k_cnt <= 2'd0; i_cnt <= 2'd0; j_cnt <= 2'd0;
-                end
-
-                // GEMM_COMPUTE: one MAC per mul_done_w pulse
-                //   acc[acc_idx] += ikha_elem * pb_elem (shared_add feeds mul_result)
-                //   Advance k/i/j after each MAC (j fastest)
-                GEMM_COMPUTE: begin
-                    if (mul_done_w) begin
-                        // Write accumulator
-                        case (acc_idx)
-                            4'd0: acc[0] <= shared_add_r;
-                            4'd1: acc[1] <= shared_add_r;
-                            4'd2: acc[2] <= shared_add_r;
-                            4'd3: acc[3] <= shared_add_r;
-                            4'd4: acc[4] <= shared_add_r;
-                            4'd5: acc[5] <= shared_add_r;
-                            4'd6: acc[6] <= shared_add_r;
-                            4'd7: acc[7] <= shared_add_r;
-                            4'd8: acc[8] <= shared_add_r;
+                    if (add_done_w) begin
+                        case (sub_cnt)
+                            2'd0: x_out_arr[0] <= add_result;
+                            2'd1: x_out_arr[1] <= add_result;
+                            2'd2: begin
+                                x_out_arr[2] <= add_result;
+                                // Init P_UPDATE counters on transition
+                                i_cnt <= 2'd0;
+                                j_cnt <= 2'd0;
+                            end
                             default: ;
                         endcase
+                    end
+                end
 
-                        // Advance counters: j fastest, then i, then k
-                        if (j_cnt == 2'd2) begin
-                            j_cnt <= 2'd0;
-                            if (i_cnt == 2'd2) begin
-                                i_cnt <= 2'd0;
-                                if (k_cnt != 2'd2) k_cnt <= k_cnt + 2'd1;
-                            end else begin
+                // P_UPDATE: 9 MACs, rank-1 formula
+                //   mul: K[i] * P[0,j]  →  add: P[i,j] + neg(mul)  →  acc[i*3+j]
+                //   i/j advance on add_done_w
+                P_UPDATE: begin
+                    if (add_done_w) begin
+                        // Write result
+                        case ({i_cnt, j_cnt})
+                            4'b0000: acc[0] <= add_result;
+                            4'b0001: acc[1] <= add_result;
+                            4'b0010: acc[2] <= add_result;
+                            4'b0100: acc[3] <= add_result;
+                            4'b0101: acc[4] <= add_result;
+                            4'b0110: acc[5] <= add_result;
+                            4'b1000: acc[6] <= add_result;
+                            4'b1001: acc[7] <= add_result;
+                            4'b1010: acc[8] <= add_result;
+                            default: ;
+                        endcase
+                        // Advance counters (j fastest)
+                        if (!pu_last) begin
+                            if (j_cnt == 2'd2) begin
+                                j_cnt <= 2'd0;
                                 i_cnt <= i_cnt + 2'd1;
+                            end else begin
+                                j_cnt <= j_cnt + 2'd1;
                             end
-                        end else begin
-                            j_cnt <= j_cnt + 2'd1;
                         end
                     end
                 end
 
-                DONE_S: ;
                 default: ;
             endcase
         end
