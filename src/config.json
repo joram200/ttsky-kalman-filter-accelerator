@@ -19,9 +19,12 @@
   "//": "The value is in nanoseconds, so 20ns == 50MHz.",
   "CLOCK_PERIOD": 20,
 
-  "//": "Hold slack margin - Increase them in case you are getting hold violations.",
-  "PL_RESIZER_HOLD_SLACK_MARGIN": 0.1,
-  "GRT_RESIZER_HOLD_SLACK_MARGIN": 0.05,
+  "//": "Hold slack margin - set to 0.0 to fix only genuine violations (safe at 50 MHz on sky130).",
+  "PL_RESIZER_HOLD_SLACK_MARGIN": 0.0,
+  "GRT_RESIZER_HOLD_SLACK_MARGIN": 0.0,
+
+  "//": "Aggressive area synthesis — reduces cell count without changing RTL behaviour.",
+  "SYNTH_STRATEGY": "AREA 3",
 
   "//": "RUN_LINTER, LINTER_INCLUDE_PDK_MODELS - Disabling the linter is not recommended!",
   "RUN_LINTER": 1,

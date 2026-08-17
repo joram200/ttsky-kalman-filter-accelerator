@@ -133,32 +133,11 @@ module int12_div (
                 busy        <= 1'b1;
             end else if (busy) begin
                 if (bit_cnt < 5'd17) begin
-                    if (!trial[16]) begin
-                        partial_rem <= trial;
-                        if (bit_cnt > 5'd0) begin
-                            case (bit_cnt)
-                                5'd1:  quotient[15] <= 1'b1;
-                                5'd2:  quotient[14] <= 1'b1;
-                                5'd3:  quotient[13] <= 1'b1;
-                                5'd4:  quotient[12] <= 1'b1;
-                                5'd5:  quotient[11] <= 1'b1;
-                                5'd6:  quotient[10] <= 1'b1;
-                                5'd7:  quotient[9]  <= 1'b1;
-                                5'd8:  quotient[8]  <= 1'b1;
-                                5'd9:  quotient[7]  <= 1'b1;
-                                5'd10: quotient[6]  <= 1'b1;
-                                5'd11: quotient[5]  <= 1'b1;
-                                5'd12: quotient[4]  <= 1'b1;
-                                5'd13: quotient[3]  <= 1'b1;
-                                5'd14: quotient[2]  <= 1'b1;
-                                5'd15: quotient[1]  <= 1'b1;
-                                5'd16: quotient[0]  <= 1'b1;
-                                default: ;
-                            endcase
-                        end
-                    end else begin
-                        partial_rem <= shifted_rem;
-                    end
+                    // Shift-register quotient: MSB first, one bit per cycle.
+                    // Equivalent to the case decoder but without the 16-way decode logic.
+                    partial_rem <= (!trial[16]) ? trial : shifted_rem;
+                    if (bit_cnt > 5'd0)
+                        quotient <= {quotient[14:0], !trial[16]};
                     bit_cnt <= bit_cnt + 5'd1;
                 end else begin
                     done    <= 1'b1;
