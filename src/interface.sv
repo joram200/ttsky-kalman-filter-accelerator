@@ -4,9 +4,9 @@
 // INT16 Q8.8 fixed-point version, 1D (scalar) state.
 //
 // Protocol: CPOL=0, CPHA=0, MSB-first, 8-bit frames.
-// Transaction: 1 command byte + 8 data bytes (64-bit SPI word).
+// Transaction: 1 command byte + 2 data bytes (24-bit SPI word).
 // Command byte: bit[7]=R/W (1=write, 0=read), bits[6:0]=register address.
-// INT16 value occupies the LOWER 16 bits of each 64-bit SPI word.
+// INT16 value occupies the 2 data bytes (MSB first).
 //
 // Register map (8 registers, indices 0–7):
 //   0   CTRL      W    [0]=start one-shot, [1]=sw_rst (level)
@@ -73,12 +73,12 @@ module spi_slave (
 
     spi_st_t st;
     logic [2:0] bit_cnt;
-    logic [2:0] byte_cnt;
+    logic       byte_cnt;   // 0 = first data byte (MSB), 1 = second data byte (LSB)
     logic       rw;
     logic [6:0] cur_addr;
-    logic [7:0]  rx_byte;
-    logic [55:0] rx_acc;
-    logic [63:0] tx_shift;
+    logic [7:0] rx_byte;
+    logic [7:0] rx_hi;      // saved MSB of 16-bit data word
+    logic [15:0] tx_shift;
     logic        done_latch;
 
     localparam logic [15:0] R_DEFAULT = 16'h0500; // 5.0 in Q8.8
@@ -91,31 +91,26 @@ module spi_slave (
     assign P_in_reg = P_in_r;
 
     // -------------------------------------------------------------------------
-    // Register read: returns {48'h0, int16_value} in 64-bit SPI word
+    // Register read: returns 16-bit value for 2-byte SPI data field
     // -------------------------------------------------------------------------
-    function automatic logic [63:0] reg_read_fn (input logic [6:0] addr);
+    function automatic logic [15:0] reg_read_fn (input logic [6:0] addr);
         case (addr)
-            7'd1: reg_read_fn = {62'b0, busy, done_latch};
-            7'd4: reg_read_fn = {48'h0, x_out};
-            7'd6: reg_read_fn = {48'h0, P_out};
-            7'd7: reg_read_fn = {48'h0, r_val};
-            default: reg_read_fn = 64'h0;
+            7'd1: reg_read_fn = {14'b0, busy, done_latch};
+            7'd4: reg_read_fn = x_out;
+            7'd6: reg_read_fn = P_out;
+            7'd7: reg_read_fn = r_val;
+            default: reg_read_fn = 16'h0;
         endcase
     endfunction
 
-    // Pre-compute constant bit/range-selects (iverilog 12 "sorry" fix)
-    wire [63:0] tx_shift_shifted = {tx_shift[62:0], 1'b0};
-    wire        miso_hold        = tx_shift[63];
+    // Pre-compute constant bit/range-selects (iverilog "sorry" fix)
+    wire [15:0] tx_shift_shifted = {tx_shift[14:0], 1'b0};
+    wire        miso_hold        = tx_shift[15];
 
     wire [6:0] rx_byte_lo   = rx_byte[6:0];
     wire       rx_byte_b6   = rx_byte[6];
     wire [5:0] rx_byte_b5_0 = rx_byte[5:0];
     wire       rx_byte_b0   = rx_byte[0];
-
-    wire [47:0] rx_acc_lo   = rx_acc[47:0];
-
-    // INT16 extraction: lower 16 bits of 64-bit SPI word = bytes 6 and 7
-    wire [7:0] rx_acc_b6 = rx_acc[7:0];
 
     // -------------------------------------------------------------------------
     // Main sequential block
@@ -124,12 +119,12 @@ module spi_slave (
         if (!rst_n) begin
             st         <= ST_IDLE;
             bit_cnt    <= 3'd0;
-            byte_cnt   <= 3'd0;
+            byte_cnt   <= 1'b0;
             rw         <= 1'b0;
             cur_addr   <= 7'd0;
             rx_byte    <= 8'h0;
-            rx_acc     <= 56'h0;
-            tx_shift   <= 64'h0;
+            rx_hi      <= 8'h0;
+            tx_shift   <= 16'h0;
             miso       <= 1'b0;
             done_latch <= 1'b0;
             core_start <= 1'b0;
@@ -146,9 +141,9 @@ module spi_slave (
             if (cs_fall) begin
                 st       <= ST_CMD;
                 bit_cnt  <= 3'd0;
-                byte_cnt <= 3'd0;
+                byte_cnt <= 1'b0;
                 rx_byte  <= 8'h0;
-                rx_acc   <= 56'h0;
+                rx_hi    <= 8'h0;
             end
 
             if (cs_rise) st <= ST_IDLE;
@@ -163,9 +158,9 @@ module spi_slave (
                             cur_addr <= {rx_byte_b5_0, mosi_r};
                             st       <= ST_DATA;
                             bit_cnt  <= 3'd0;
-                            byte_cnt <= 3'd0;
+                            byte_cnt <= 1'b0;
                             rx_byte  <= 8'h0;
-                            rx_acc   <= 56'h0;
+                            rx_hi    <= 8'h0;
                             if (!rx_byte_b6) begin
                                 tx_shift <= reg_read_fn({rx_byte_b5_0, mosi_r});
                                 if ({rx_byte_b5_0, mosi_r} == 7'd1) done_latch <= 1'b0;
@@ -179,20 +174,21 @@ module spi_slave (
                         rx_byte <= {rx_byte_lo, mosi_r};
                         if (bit_cnt == 3'd7) begin
                             bit_cnt <= 3'd0;
-                            if (byte_cnt == 3'd7) begin
-                                byte_cnt <= 3'd0;
-                                rx_acc   <= 56'h0;
+                            if (byte_cnt == 1'b1) begin
+                                // Second (last) data byte complete — 16-bit word ready
+                                byte_cnt <= 1'b0;
                                 rx_byte  <= 8'h0;
+                                rx_hi    <= 8'h0;
                                 if (rw) begin
                                     case (cur_addr)
                                         7'd0: begin
                                             core_start <= mosi_r;
                                             sw_rst     <= rx_byte_b0;
                                         end
-                                        7'd2: z_reg  <= {rx_acc_b6, rx_byte_lo, mosi_r};
-                                        7'd3: x_in_r <= {rx_acc_b6, rx_byte_lo, mosi_r};
-                                        7'd5: P_in_r <= {rx_acc_b6, rx_byte_lo, mosi_r};
-                                        7'd7: r_val  <= {rx_acc_b6, rx_byte_lo, mosi_r};
+                                        7'd2: z_reg  <= {rx_hi, rx_byte_lo, mosi_r};
+                                        7'd3: x_in_r <= {rx_hi, rx_byte_lo, mosi_r};
+                                        7'd5: P_in_r <= {rx_hi, rx_byte_lo, mosi_r};
+                                        7'd7: r_val  <= {rx_hi, rx_byte_lo, mosi_r};
                                         default: ;
                                     endcase
                                 end
@@ -202,8 +198,9 @@ module spi_slave (
                                     if ((cur_addr + 7'd1) == 7'd1) done_latch <= 1'b0;
                                 end
                             end else begin
-                                rx_acc   <= {rx_acc_lo, rx_byte_lo, mosi_r};
-                                byte_cnt <= byte_cnt + 3'd1;
+                                // First data byte (MSB) complete — save it
+                                rx_hi    <= {rx_byte_lo, mosi_r};
+                                byte_cnt <= 1'b1;
                                 rx_byte  <= 8'h0;
                             end
                         end else begin

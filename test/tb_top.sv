@@ -2,6 +2,8 @@
 // tb_top.sv — SPI master BFM testbench for tt_um_joram200
 // INT16 Q8.8 fixed-point, 1D (scalar) state.
 //
+// Protocol: 3-byte SPI (1 cmd byte + 2 data bytes for 16-bit INT16).
+//
 // Register map (8 registers):
 //   0   CTRL       W    [0]=start, [1]=sw_rst
 //   1   STAT       R    [0]=done,  [1]=busy
@@ -18,7 +20,7 @@
 `timescale 1ns/1ps
 
 // -----------------------------------------------------------------------------
-// spi_master_bfm — SPI master bus functional model
+// spi_master_bfm — SPI master bus functional model (3-byte protocol)
 // -----------------------------------------------------------------------------
 module spi_master_bfm #(
     parameter real SPI_CLK_NS = 80.0
@@ -29,7 +31,7 @@ module spi_master_bfm #(
     output logic        cs_n,
     input  logic        miso
 );
-    logic [63:0] burst_buf [0:8];
+    logic [15:0] burst_buf [0:8];
 
     integer _bb;
     initial begin
@@ -37,7 +39,7 @@ module spi_master_bfm #(
         mosi = 1'b0;
         cs_n = 1'b1;
         for (_bb = 0; _bb < 9; _bb = _bb + 1)
-            burst_buf[_bb] = 64'h0;
+            burst_buf[_bb] = 16'h0;
     end
 
     task automatic spi_xfer_byte (
@@ -56,36 +58,34 @@ module spi_master_bfm #(
         end
     endtask
 
+    // Write: 1 cmd byte + 2 data bytes (16-bit, MSB first)
     task automatic spi_write (
         input logic [6:0]  addr,
-        input logic [63:0] data
+        input logic [15:0] data
     );
         logic [7:0] dummy;
-        integer byte_idx;
         cs_n = 1'b0;
         #(SPI_CLK_NS);
         spi_xfer_byte(8'h80 | {1'b0, addr}, dummy);
-        for (byte_idx = 7; byte_idx >= 0; byte_idx = byte_idx - 1)
-            spi_xfer_byte(data[byte_idx*8 +: 8], dummy);
+        spi_xfer_byte(data[15:8], dummy);
+        spi_xfer_byte(data[7:0],  dummy);
         #(SPI_CLK_NS);
         cs_n = 1'b1;
         #(SPI_CLK_NS * 2.0);
     endtask
 
+    // Read: 1 cmd byte + 2 data bytes (16-bit, MSB first)
     task automatic spi_read (
         input  logic [6:0]  addr,
-        output logic [63:0] data
+        output logic [15:0] data
     );
         logic [7:0] dummy, rx_b;
-        integer byte_idx;
-        data = 64'h0;
+        data = 16'h0;
         cs_n = 1'b0;
         #(SPI_CLK_NS);
         spi_xfer_byte(8'h00 | {1'b0, addr}, dummy);
-        for (byte_idx = 7; byte_idx >= 0; byte_idx = byte_idx - 1) begin
-            spi_xfer_byte(8'h00, rx_b);
-            data[byte_idx*8 +: 8] = rx_b;
-        end
+        spi_xfer_byte(8'h00, rx_b); data[15:8] = rx_b;
+        spi_xfer_byte(8'h00, rx_b); data[7:0]  = rx_b;
         #(SPI_CLK_NS);
         cs_n = 1'b1;
         #(SPI_CLK_NS * 2.0);
@@ -96,13 +96,13 @@ module spi_master_bfm #(
         input int         n
     );
         logic [7:0] dummy;
-        integer reg_i, byte_idx;
+        integer reg_i;
         cs_n = 1'b0;
         #(SPI_CLK_NS);
         spi_xfer_byte(8'h80 | {1'b0, start_addr}, dummy);
         for (reg_i = 0; reg_i < n; reg_i = reg_i + 1) begin
-            for (byte_idx = 7; byte_idx >= 0; byte_idx = byte_idx - 1)
-                spi_xfer_byte(burst_buf[reg_i][byte_idx*8 +: 8], dummy);
+            spi_xfer_byte(burst_buf[reg_i][15:8], dummy);
+            spi_xfer_byte(burst_buf[reg_i][7:0],  dummy);
         end
         #(SPI_CLK_NS);
         cs_n = 1'b1;
@@ -114,16 +114,14 @@ module spi_master_bfm #(
         input int         n
     );
         logic [7:0] dummy, rx_b;
-        integer reg_i, byte_idx;
+        integer reg_i;
         cs_n = 1'b0;
         #(SPI_CLK_NS);
         spi_xfer_byte(8'h00 | {1'b0, start_addr}, dummy);
         for (reg_i = 0; reg_i < n; reg_i = reg_i + 1) begin
-            burst_buf[reg_i] = 64'h0;
-            for (byte_idx = 7; byte_idx >= 0; byte_idx = byte_idx - 1) begin
-                spi_xfer_byte(8'h00, rx_b);
-                burst_buf[reg_i][byte_idx*8 +: 8] = rx_b;
-            end
+            burst_buf[reg_i] = 16'h0;
+            spi_xfer_byte(8'h00, rx_b); burst_buf[reg_i][15:8] = rx_b;
+            spi_xfer_byte(8'h00, rx_b); burst_buf[reg_i][7:0]  = rx_b;
         end
         #(SPI_CLK_NS);
         cs_n = 1'b1;
@@ -133,7 +131,7 @@ module spi_master_bfm #(
     task automatic poll_done (
         input int timeout_ns
     );
-        logic [63:0] stat;
+        logic [15:0] stat;
         int elapsed;
         elapsed = 0;
         do begin
@@ -157,20 +155,20 @@ endmodule
 module result_checker #(
     parameter int ULP_THRESHOLD = 4
 )();
-    logic [63:0] REF_XOUT;
-    logic [63:0] REF_POUT;
-    logic [63:0] hw_x;
-    logic [63:0] hw_p;
+    logic [15:0] REF_XOUT;
+    logic [15:0] REF_POUT;
+    logic [15:0] hw_x;
+    logic [15:0] hw_p;
 
     initial begin
-        REF_XOUT = 64'h000000000000003F;
-        REF_POUT = 64'h00000000000000D6;
-        hw_x = 64'h0;
-        hw_p = 64'h0;
+        REF_XOUT = 16'h003F;
+        REF_POUT = 16'h00D6;
+        hw_x = 16'h0;
+        hw_p = 16'h0;
     end
 
     function automatic longint unsigned ulp_dist (
-        input logic [63:0] a, b
+        input logic [15:0] a, b
     );
         longint signed ai, bi;
         ai = $signed(a);
@@ -185,7 +183,7 @@ module result_checker #(
 
         d = ulp_dist(hw_x, REF_XOUT);
         if (d > ULP_THRESHOLD) begin
-            $error("x_out: hw=%016h ref=%016h ULP=%0d FAIL", hw_x, REF_XOUT, d);
+            $error("x_out: hw=%04h ref=%04h ULP=%0d FAIL", hw_x, REF_XOUT, d);
             pass = 0;
         end else begin
             $display("x_out: ULP=%0d PASS", d);
@@ -193,7 +191,7 @@ module result_checker #(
 
         d = ulp_dist(hw_p, REF_POUT);
         if (d > ULP_THRESHOLD) begin
-            $error("P_out: hw=%016h ref=%016h ULP=%0d FAIL", hw_p, REF_POUT, d);
+            $error("P_out: hw=%04h ref=%04h ULP=%0d FAIL", hw_p, REF_POUT, d);
             pass = 0;
         end else begin
             $display("P_out: ULP=%0d PASS", d);
@@ -215,14 +213,14 @@ endmodule
 module program_block (
     input  logic clk
 );
-    logic [63:0] Z_VAL;
-    logic [63:0] X_IN;
-    logic [63:0] P_IN;
+    logic [15:0] Z_VAL;
+    logic [15:0] X_IN;
+    logic [15:0] P_IN;
 
     initial begin
-        Z_VAL = 64'h0000000000000180;  // 1.5 Q8.8
-        X_IN  = 64'h0000000000000000;  // 0.0 Q8.8
-        P_IN  = 64'h0000000000000100;  // 1.0 Q8.8
+        Z_VAL = 16'h0180;  // 1.5 Q8.8
+        X_IN  = 16'h0000;  // 0.0 Q8.8
+        P_IN  = 16'h0100;  // 1.0 Q8.8
     end
 endmodule
 
@@ -282,7 +280,7 @@ module tb_top;
         rst_n = 1'b1;
         repeat(10) @(posedge clk);
 
-        $display("=== SPI Kalman update test (INT16 Q8.8, 1D scalar) ===");
+        $display("=== SPI Kalman update test (INT16 Q8.8, 1D scalar, 3-byte SPI) ===");
 
         // Write z (reg 2), x_in (reg 3) in one burst of 2
         u_bfm.burst_buf[0] = u_prog.Z_VAL;
@@ -292,8 +290,8 @@ module tb_top;
         // Write P_in (reg 5) individually
         u_bfm.spi_write(7'd5, u_prog.P_IN);
 
-        // Fire: write CTRL.start = 1
-        u_bfm.spi_write(7'd0, 64'h0000000000000001);
+        // Fire: write CTRL.start = 1 (bit 0)
+        u_bfm.spi_write(7'd0, 16'h0001);
 
         // Poll done (500 µs timeout)
         $display("Waiting for done...");
