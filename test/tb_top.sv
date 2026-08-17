@@ -1,6 +1,6 @@
 // =============================================================================
 // tb_top.sv — Parallel GPIO testbench for tt_um_joram200
-// INT12 Q4.8 fixed-point, 1D (scalar) state.
+// INT10 Q4.6 fixed-point, 1D (scalar) state.
 //
 // Write protocol (byte-serial, MSB first):
 //   Set addr, byte_sel=0, wr_data=MSB, pulse wr_en ≥1 clk.
@@ -12,15 +12,16 @@
 //
 // Register map:
 //   1   STAT      R    [0]=done_latch, [1]=busy
-//   2   z         W    measurement Q4.8
+//   2   z         W    measurement Q4.6
 //   3   x_in      W    prior scalar state
 //   4   x_out     R    corrected scalar state
 //   5   P_in      W    prior scalar covariance
 //   6   P_out     R    updated scalar covariance
-//   7   R_REG     R/W  measurement noise R (default 5.0 Q4.8 = 0x500)
+//   7   R_REG     R/W  measurement noise R (default 5.0 Q4.6 = 0x140)
 //
 // Scenario: z=1.5, x_in=0, P_in=1.0, R=5.0
-//   Expected: x_out=0x003F (63/256≈0.246), P_out=0x00D6 (214/256≈0.836)
+//   Q4.6 math: y=96, S=384, S_inv=10, K=10, ky=15, kp=10
+//   Expected: x_out=0x000F (15/64≈0.234), P_out=0x0036 (54/64=0.844)
 // =============================================================================
 `timescale 1ns/1ps
 
@@ -120,11 +121,11 @@ endmodule
 
 
 // -----------------------------------------------------------------------------
-// result_checker — compare INT12 Q4.8 scalar outputs against golden reference
+// result_checker — compare INT10 Q4.6 scalar outputs against golden reference
 //
-// Scenario: z=1.5, x=0, P=1.0, R=5.0  (Q4.8)
-//   x_out = 0x003F (63/256 ≈ 0.246)
-//   P_out = 0x00D6 (214/256 ≈ 0.836)
+// Scenario: z=1.5, x=0, P=1.0, R=5.0  (Q4.6)
+//   x_out = 0x000F (15/64 ≈ 0.234)
+//   P_out = 0x0036 (54/64 = 0.844)
 // -----------------------------------------------------------------------------
 module result_checker #(
     parameter int ULP_THRESHOLD = 4
@@ -135,8 +136,8 @@ module result_checker #(
     logic [15:0] hw_p;
 
     initial begin
-        REF_XOUT = 16'h003F;
-        REF_POUT = 16'h00D6;
+        REF_XOUT = 16'h000F;
+        REF_POUT = 16'h0036;
         hw_x     = 16'h0;
         hw_p     = 16'h0;
     end
@@ -179,8 +180,8 @@ endmodule
 
 
 // -----------------------------------------------------------------------------
-// program_block — INT12 Q4.8 test scenario data (1D scalar)
-// Scenario: z=1.5, x_in=0, P_in=1.0, R=5.0
+// program_block — INT10 Q4.6 test scenario data (1D scalar)
+// Scenario: z=1.5, x_in=0, P_in=1.0, R=5.0  (R=default, no write needed)
 // -----------------------------------------------------------------------------
 module program_block (
     input  logic clk
@@ -190,9 +191,9 @@ module program_block (
     logic [15:0] P_IN;
 
     initial begin
-        Z_VAL = 16'h0180;  // 1.5 Q8.8
-        X_IN  = 16'h0000;  // 0.0 Q8.8
-        P_IN  = 16'h0100;  // 1.0 Q8.8
+        Z_VAL = 16'h0060;  // 1.5 Q4.6 = 96 = 0x60
+        X_IN  = 16'h0000;  // 0.0 Q4.6
+        P_IN  = 16'h0040;  // 1.0 Q4.6 = 64 = 0x40
     end
 endmodule
 
@@ -243,7 +244,7 @@ module tb_top;
         rst_n = 1'b1;
         repeat(5)  @(posedge clk);
 
-        $display("=== Parallel GPIO Kalman update test (INT12 Q4.8, 1D scalar) ===");
+        $display("=== Parallel GPIO Kalman update test (INT10 Q4.6, 1D scalar) ===");
 
         // Write z (reg 2), x_in (reg 3), P_in (reg 5)
         u_bfm.par_write(3'd2, u_prog.Z_VAL);
