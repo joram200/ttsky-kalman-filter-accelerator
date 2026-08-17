@@ -1,13 +1,13 @@
 `timescale 1ns/1ps
 // =============================================================================
 // interface.sv — Parallel GPIO register file for tt_um_joram200
-// INT16 Q8.8 fixed-point version, 1D (scalar) state.
+// INT12 Q4.8 fixed-point version, 1D (scalar) state.
 //
 // Write protocol (byte-serial, MSB first):
 //   1. Place register address on addr[2:0], 0 on byte_sel, MSB byte on wr_data.
 //   2. Pulse wr_en high for ≥1 clk cycle → MSB stored.
 //   3. Place LSB byte on wr_data, 1 on byte_sel.
-//   4. Pulse wr_en again → LSB stored, 16-bit write complete.
+//   4. Pulse wr_en again → LSB stored, 12-bit write complete.
 //
 // Read protocol (combinational):
 //   Set addr[2:0] and byte_sel; rd_data is valid the same cycle.
@@ -15,12 +15,12 @@
 // Register map (8 registers, indices 0–7):
 //   0   (reserved)
 //   1   STAT      R    [0]=done_latch (clears on next start), [1]=busy
-//   2   z         W    scalar measurement Q8.8
-//   3   x_in      W    prior scalar state Q8.8
-//   4   x_out     R    corrected scalar state Q8.8
-//   5   P_in      W    prior scalar covariance Q8.8
-//   6   P_out     R    updated scalar covariance Q8.8
-//   7   R_REG     R/W  measurement noise R; reset default = 5.0 (0x0500)
+//   2   z         W    scalar measurement Q4.8
+//   3   x_in      W    prior scalar state Q4.8
+//   4   x_out     R    corrected scalar state Q4.8
+//   5   P_in      W    prior scalar covariance Q4.8
+//   6   P_out     R    updated scalar covariance Q4.8
+//   7   R_REG     R/W  measurement noise R; reset default = 5.0 (0x500 Q4.8)
 //
 // Dedicated control pins (not register-mapped):
 //   start_in  → rising-edge one-shot core_start; also clears done_latch
@@ -40,20 +40,20 @@ module par_reg (
     output logic        core_start,
     output logic        sw_rst,
     // Register file outputs
-    output logic [15:0] z_reg,
-    output logic [15:0] x_in_reg,
-    output logic [15:0] P_in_reg,
-    output logic [15:0] r_val,
+    output logic [11:0] z_reg,
+    output logic [11:0] x_in_reg,
+    output logic [11:0] P_in_reg,
+    output logic [11:0] r_val,
     // Core status inputs
     input  logic        done,
     input  logic        busy,
-    input  logic [15:0] x_out,
-    input  logic [15:0] P_out,
+    input  logic [11:0] x_out,
+    input  logic [11:0] P_out,
     // Byte-wide read data output
     output logic [7:0]  rd_data
 );
 
-    localparam logic [15:0] R_DEFAULT = 16'h0500; // 5.0 in Q8.8
+    localparam logic [11:0] R_DEFAULT = 12'h500; // 5.0 in Q4.8
 
     // -------------------------------------------------------------------------
     // Two-stage synchronisers for edge-triggered control inputs
@@ -82,8 +82,8 @@ module par_reg (
     // -------------------------------------------------------------------------
     // Register file
     // -------------------------------------------------------------------------
-    logic [15:0] x_in_r;
-    logic [15:0] P_in_r;
+    logic [11:0] x_in_r;
+    logic [11:0] P_in_r;
     logic        done_latch;
 
     assign x_in_reg = x_in_r;
@@ -93,9 +93,9 @@ module par_reg (
         if (!rst_n) begin
             core_start <= 1'b0;
             done_latch <= 1'b0;
-            z_reg      <= 16'h0;
-            x_in_r     <= 16'h0;
-            P_in_r     <= 16'h0;
+            z_reg      <= 12'h0;
+            x_in_r     <= 12'h0;
+            P_in_r     <= 12'h0;
             r_val      <= R_DEFAULT;
         end else begin
             core_start <= start_rise;
@@ -105,10 +105,10 @@ module par_reg (
             if (wr_rise) begin
                 if (!byte_sel) begin
                     case (addr)
-                        3'd2: z_reg[15:8]  <= wr_data;
-                        3'd3: x_in_r[15:8] <= wr_data;
-                        3'd5: P_in_r[15:8] <= wr_data;
-                        3'd7: r_val[15:8]  <= wr_data;
+                        3'd2: z_reg[11:8]  <= wr_data[3:0];
+                        3'd3: x_in_r[11:8] <= wr_data[3:0];
+                        3'd5: P_in_r[11:8] <= wr_data[3:0];
+                        3'd7: r_val[11:8]  <= wr_data[3:0];
                         default: ;
                     endcase
                 end else begin
@@ -131,9 +131,9 @@ module par_reg (
     always_comb begin
         case (addr)
             3'd1:    rd_word = {14'b0, busy, done_latch};
-            3'd4:    rd_word = x_out;
-            3'd6:    rd_word = P_out;
-            3'd7:    rd_word = r_val;
+            3'd4:    rd_word = {4'b0, x_out};
+            3'd6:    rd_word = {4'b0, P_out};
+            3'd7:    rd_word = {4'b0, r_val};
             default: rd_word = 16'h0;
         endcase
     end

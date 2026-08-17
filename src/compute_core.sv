@@ -1,14 +1,14 @@
 `timescale 1ns/1ps
 // =============================================================================
-// compute_core.sv — INT16 Q8.8 fixed-point scalar Kalman filter (1D state)
+// compute_core.sv — INT12 Q4.8 fixed-point scalar Kalman filter (1D state)
 //
-// Q8.8 format: value_real = register_value / 256  (signed 16-bit integer)
-//   Multiply: (a_Q88 × b_Q88) >> 8  → Q8.8 result
-//   1/S:      65536 / S_Q88          → S_inv in Q8.8
+// Q4.8 format: value_real = register_value / 256  (signed 12-bit integer)
+//   Multiply: (a_Q48 × b_Q48) >> 8  → Q4.8 result
+//   1/S:      65536 / S_Q48          → S_inv in Q4.8
 //
 // Modules:
-//   int16_mul_seq  — 17-cycle signed 16×16→16 shift-and-add (Baugh-Wooley)
-//   int16_div      — 17-cycle restoring divider: floor(65536 / S_Q88)
+//   int12_mul_seq  — 13-cycle signed 12×12→12 shift-and-add (Baugh-Wooley)
+//   int12_div      — 17-cycle restoring divider: floor(65536 / S_Q48)
 //   kalman_update  — FSM; 1D (scalar) state; 1 shared multiplier + 1 divider
 //
 // Scalar update (H=1, F=1, Q=0):
@@ -25,30 +25,30 @@
 // =============================================================================
 
 // -----------------------------------------------------------------------------
-// int16_mul_seq — Signed 16×16 → 16 shift-and-add multiplier (17 cycles)
-//   Baugh-Wooley: bits 0..14 add partial product; bit 15 subtracts.
-//   result = signed(a) × signed(b) >> 8  (Q8.8 × Q8.8 → Q8.8)
+// int12_mul_seq — Signed 12×12 → 12 shift-and-add multiplier (13 cycles)
+//   Baugh-Wooley: bits 0..10 add partial product; bit 11 subtracts.
+//   result = signed(a) × signed(b) >> 8  (Q4.8 × Q4.8 → Q4.8)
 // -----------------------------------------------------------------------------
-module int16_mul_seq (
+module int12_mul_seq (
     input  logic        clk,
     input  logic        rst_n,
     input  logic        start,
-    input  logic [15:0] a,
-    input  logic [15:0] b,
-    output logic [15:0] result,
+    input  logic [11:0] a,
+    input  logic [11:0] b,
+    output logic [11:0] result,
     output logic        done
 );
-    logic [31:0] accum;
-    logic [15:0] a_r;
-    logic [31:0] b_ext;
-    logic [4:0]  bit_cnt;
+    logic [23:0] accum;
+    logic [11:0] a_r;
+    logic [23:0] b_ext;
+    logic [3:0]  bit_cnt;
     logic        busy;
 
-    logic [31:0] new_accum;
+    logic [23:0] new_accum;
     always_comb begin
         if (!a_r[0])
             new_accum = accum;
-        else if (bit_cnt < 5'd15)
+        else if (bit_cnt < 4'd11)
             new_accum = accum + b_ext;
         else
             new_accum = accum - b_ext;
@@ -56,28 +56,28 @@ module int16_mul_seq (
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            busy    <= 1'b0; done    <= 1'b0; result  <= 16'h0;
-            accum   <= 32'h0; bit_cnt <= 5'd0;
-            a_r     <= 16'h0; b_ext   <= 32'h0;
+            busy    <= 1'b0; done    <= 1'b0; result  <= 12'h0;
+            accum   <= 24'h0; bit_cnt <= 4'd0;
+            a_r     <= 12'h0; b_ext   <= 24'h0;
         end else begin
             done <= 1'b0;
             if (start && !busy) begin
                 a_r     <= a;
-                b_ext   <= {{16{b[15]}}, b};
-                accum   <= 32'h0;
-                bit_cnt <= 5'd0;
+                b_ext   <= {{12{b[11]}}, b};
+                accum   <= 24'h0;
+                bit_cnt <= 4'd0;
                 busy    <= 1'b1;
             end else if (busy) begin
-                if (bit_cnt < 5'd16) begin
+                if (bit_cnt < 4'd12) begin
                     accum   <= new_accum;
-                    b_ext   <= {b_ext[30:0], 1'b0};
-                    a_r     <= {1'b0, a_r[15:1]};
-                    bit_cnt <= bit_cnt + 5'd1;
+                    b_ext   <= {b_ext[22:0], 1'b0};
+                    a_r     <= {1'b0, a_r[11:1]};
+                    bit_cnt <= bit_cnt + 4'd1;
                 end else begin
-                    result  <= accum[23:8];
+                    result  <= accum[19:8];
                     done    <= 1'b1;
                     busy    <= 1'b0;
-                    bit_cnt <= 5'd0;
+                    bit_cnt <= 4'd0;
                 end
             end
         end
@@ -85,20 +85,20 @@ module int16_mul_seq (
 endmodule
 
 // -----------------------------------------------------------------------------
-// int16_div — Sequential restoring divider: floor(65536 / S_Q88)
-//   Returns S_inv in Q8.8: 1/S_real = S_inv_Q88 / 256.
-//   17 cycles. Saturates to 0xFFFF if S_Q88 == 0.
+// int12_div — Sequential restoring divider: floor(65536 / S_Q48)
+//   Returns S_inv in Q4.8: 1/S_real = S_inv_Q48 / 256.
+//   17 cycles. Saturates to 0xFFF if S_Q48 == 0.
 // -----------------------------------------------------------------------------
-module int16_div (
+module int12_div (
     input  logic        clk,
     input  logic        rst_n,
     input  logic        start,
-    input  logic [15:0] S_Q88,
-    output logic [15:0] inv_Q88,
+    input  logic [11:0] S_Q48,
+    output logic [11:0] inv_Q48,
     output logic        done
 );
     logic [16:0] partial_rem;
-    logic [15:0] divisor_r;
+    logic [11:0] divisor_r;
     logic [15:0] quotient;
     logic [4:0]  bit_cnt;
     logic        busy;
@@ -109,17 +109,17 @@ module int16_div (
 
     assign dbit        = (bit_cnt == 5'd0) ? 1'b1 : 1'b0;
     assign shifted_rem = {partial_rem[15:0], dbit};
-    assign trial       = shifted_rem - {1'b0, divisor_r};
+    assign trial       = shifted_rem - {5'b0, divisor_r};
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            busy <= 1'b0; done <= 1'b0; inv_Q88 <= 16'h0;
-            partial_rem <= 17'h0; divisor_r <= 16'h0;
+            busy <= 1'b0; done <= 1'b0; inv_Q48 <= 12'h0;
+            partial_rem <= 17'h0; divisor_r <= 12'h0;
             quotient <= 16'h0; bit_cnt <= 5'd0;
         end else begin
             done <= 1'b0;
             if (start && !busy) begin
-                divisor_r   <= (S_Q88 == 16'h0) ? 16'h0001 : S_Q88;
+                divisor_r   <= (S_Q48 == 12'h0) ? 12'h001 : S_Q48;
                 partial_rem <= 17'h0;
                 quotient    <= 16'h0;
                 bit_cnt     <= 5'd0;
@@ -154,7 +154,8 @@ module int16_div (
                     end
                     bit_cnt <= bit_cnt + 5'd1;
                 end else begin
-                    inv_Q88 <= (S_Q88 == 16'h0) ? 16'hFFFF : quotient;
+                    inv_Q48 <= (S_Q48 == 12'h0) ? 12'hFFF :
+                               (|quotient[15:12])  ? 12'hFFF : quotient[11:0];
                     done    <= 1'b1;
                     busy    <= 1'b0;
                     bit_cnt <= 5'd0;
@@ -165,7 +166,7 @@ module int16_div (
 endmodule
 
 // -----------------------------------------------------------------------------
-// kalman_update — INT16 Q8.8 scalar Kalman filter update (1D, H=1)
+// kalman_update — INT12 Q4.8 scalar Kalman filter update (1D, H=1)
 //
 // FSM: IDLE → S_COMP → DIV → K_COMP → KY_COMP → X_ADD → P_UPDATE → DONE_S
 // S_COMP and X_ADD are combinational (1 cycle each).
@@ -175,12 +176,12 @@ module kalman_update (
     input  logic        clk,
     input  logic        rst_n,
     input  logic        start,
-    input  logic [15:0] z,
-    input  logic [15:0] x_in,
-    input  logic [15:0] P_in,
-    input  logic [15:0] r_val,
-    output logic [15:0] x_out,
-    output logic [15:0] P_out,
+    input  logic [11:0] z,
+    input  logic [11:0] x_in,
+    input  logic [11:0] P_in,
+    input  logic [11:0] r_val,
+    output logic [11:0] x_out,
+    output logic [11:0] P_out,
     output logic        done,
     output logic        busy
 );
@@ -200,28 +201,28 @@ module kalman_update (
     // -------------------------------------------------------------------------
     // Intermediate registers
     // -------------------------------------------------------------------------
-    logic [15:0] y_tilde;
-    logic [15:0] S_reg;
-    logic [15:0] S_inv;
-    logic [15:0] K_reg;
-    logic [15:0] ky_tmp;
+    logic [11:0] y_tilde;
+    logic [11:0] S_reg;
+    logic [11:0] S_inv;
+    logic [11:0] K_reg;
+    logic [11:0] ky_tmp;
 
     // -------------------------------------------------------------------------
     // Shared multiplier + divider
     // -------------------------------------------------------------------------
-    logic [15:0] mul_a, mul_b, mul_result;
+    logic [11:0] mul_a, mul_b, mul_result;
     logic        mul_start_w, mul_done_w, mul_active;
 
-    logic [15:0] div_result;
+    logic [11:0] div_result;
     logic        div_start_w, div_done_w, div_active;
 
-    int16_mul_seq u_mul (
+    int12_mul_seq u_mul (
         .clk(clk), .rst_n(rst_n), .start(mul_start_w),
         .a(mul_a), .b(mul_b), .result(mul_result), .done(mul_done_w)
     );
-    int16_div u_div (
+    int12_div u_div (
         .clk(clk), .rst_n(rst_n), .start(div_start_w),
-        .S_Q88(S_reg), .inv_Q88(div_result), .done(div_done_w)
+        .S_Q48(S_reg), .inv_Q48(div_result), .done(div_done_w)
     );
 
     // mul_start_w — fires when not active and state needs a multiply
@@ -242,7 +243,7 @@ module kalman_update (
 
     // mul_a / mul_b mux
     always_comb begin
-        mul_a = 16'h0; mul_b = 16'h0;
+        mul_a = 12'h0; mul_b = 12'h0;
         case (state)
             K_COMP:   begin mul_a = P_in;  mul_b = S_inv;   end  // K = P*S_inv
             KY_COMP:  begin mul_a = K_reg; mul_b = y_tilde; end  // ky = K*y
@@ -272,9 +273,9 @@ module kalman_update (
         if (!rst_n) begin
             state      <= IDLE;
             mul_active <= 1'b0; div_active <= 1'b0;
-            y_tilde    <= 16'h0; S_reg   <= 16'h0; S_inv  <= 16'h0;
-            K_reg      <= 16'h0; ky_tmp  <= 16'h0;
-            x_out      <= 16'h0; P_out   <= 16'h0;
+            y_tilde    <= 12'h0; S_reg   <= 12'h0; S_inv  <= 12'h0;
+            K_reg      <= 12'h0; ky_tmp  <= 12'h0;
+            x_out      <= 12'h0; P_out   <= 12'h0;
         end else begin
             state <= state_nxt;
 

@@ -1,6 +1,6 @@
 // =============================================================================
 // tb_top.sv — Parallel GPIO testbench for tt_um_joram200
-// INT16 Q8.8 fixed-point, 1D (scalar) state.
+// INT12 Q4.8 fixed-point, 1D (scalar) state.
 //
 // Write protocol (byte-serial, MSB first):
 //   Set addr, byte_sel=0, wr_data=MSB, pulse wr_en ≥1 clk.
@@ -12,12 +12,12 @@
 //
 // Register map:
 //   1   STAT      R    [0]=done_latch, [1]=busy
-//   2   z         W    measurement Q8.8
+//   2   z         W    measurement Q4.8
 //   3   x_in      W    prior scalar state
 //   4   x_out     R    corrected scalar state
 //   5   P_in      W    prior scalar covariance
 //   6   P_out     R    updated scalar covariance
-//   7   R_REG     R/W  measurement noise R (default 5.0 Q8.8 = 0x0500)
+//   7   R_REG     R/W  measurement noise R (default 5.0 Q4.8 = 0x500)
 //
 // Scenario: z=1.5, x_in=0, P_in=1.0, R=5.0
 //   Expected: x_out=0x003F (63/256≈0.246), P_out=0x00D6 (214/256≈0.836)
@@ -120,9 +120,9 @@ endmodule
 
 
 // -----------------------------------------------------------------------------
-// result_checker — compare INT16 Q8.8 scalar outputs against golden reference
+// result_checker — compare INT12 Q4.8 scalar outputs against golden reference
 //
-// Scenario: z=1.5, x=0, P=1.0, R=5.0  (Q8.8)
+// Scenario: z=1.5, x=0, P=1.0, R=5.0  (Q4.8)
 //   x_out = 0x003F (63/256 ≈ 0.246)
 //   P_out = 0x00D6 (214/256 ≈ 0.836)
 // -----------------------------------------------------------------------------
@@ -179,7 +179,7 @@ endmodule
 
 
 // -----------------------------------------------------------------------------
-// program_block — INT16 Q8.8 test scenario data (1D scalar)
+// program_block — INT12 Q4.8 test scenario data (1D scalar)
 // Scenario: z=1.5, x_in=0, P_in=1.0, R=5.0
 // -----------------------------------------------------------------------------
 module program_block (
@@ -243,7 +243,7 @@ module tb_top;
         rst_n = 1'b1;
         repeat(5)  @(posedge clk);
 
-        $display("=== Parallel GPIO Kalman update test (INT16 Q8.8, 1D scalar) ===");
+        $display("=== Parallel GPIO Kalman update test (INT12 Q4.8, 1D scalar) ===");
 
         // Write z (reg 2), x_in (reg 3), P_in (reg 5)
         u_bfm.par_write(3'd2, u_prog.Z_VAL);

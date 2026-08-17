@@ -1,7 +1,7 @@
 `timescale 1ns/1ps
 // =============================================================================
 // top.sv — Tiny Tapeout standard top-level wrapper for tt_um_joram200
-// INT16 Q8.8 fixed-point, 1D (scalar) state.
+// INT12 Q4.8 fixed-point, 1D (scalar) state.
 //
 // Instantiates:
 //   u_par  par_reg       (interface.sv) — parallel GPIO register file
@@ -38,13 +38,13 @@ module tt_um_joram200 (
     logic        core_start, sw_rst_w;
     logic        core_done,  core_busy;
 
-    // Register file wires — INT16 Q8.8, 1D scalar state
-    logic [15:0] z_w;
-    logic [15:0] r_val_w;
-    logic [15:0] x_in_w;
-    logic [15:0] P_in_w;
-    logic [15:0] x_out_w;
-    logic [15:0] P_out_w;
+    // Register file wires — INT12 Q4.8, 1D scalar state
+    logic [11:0] z_w;
+    logic [11:0] r_val_w;
+    logic [11:0] x_in_w;
+    logic [11:0] P_in_w;
+    logic [11:0] x_out_w;
+    logic [11:0] P_out_w;
 
     // Read data byte from register file
     logic [7:0]  rd_data_w;
