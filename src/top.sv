@@ -1,11 +1,11 @@
 `timescale 1ns/1ps
 // =============================================================================
 // top.sv — Tiny Tapeout standard top-level wrapper for tt_um_joram200
-// INT16 Q8.8 fixed-point, 2D state (x ∈ ℝ², P ∈ ℝ²ˣ²).
+// INT16 Q8.8 fixed-point, 1D (scalar) state.
 //
 // Instantiates:
-//   u_spi  spi_slave     (interface.sv) — SPI register file, 17 registers
-//   u_core kalman_update (compute_core.sv) — 2D Kalman update FSM
+//   u_spi  spi_slave     (interface.sv) — SPI register file, 8 registers
+//   u_core kalman_update (compute_core.sv) — 1D scalar Kalman update FSM
 //
 // Pin assignments:
 //   uio_in[0]  → SCLK (SPI clock)
@@ -43,13 +43,13 @@ module tt_um_joram200 (
     logic        core_start, sw_rst_w;
     logic        core_done,  core_busy;
 
-    // Register file wires — INT16 Q8.8, 2D state
+    // Register file wires — INT16 Q8.8, 1D scalar state
     logic [15:0] z_w;
     logic [15:0] r_val_w;
-    logic [31:0] x_in_w;    // 2×16
-    logic [63:0] P_in_w;    // 4×16
-    logic [31:0] x_out_w;   // 2×16
-    logic [63:0] P_out_w;   // 4×16
+    logic [15:0] x_in_w;
+    logic [15:0] P_in_w;
+    logic [15:0] x_out_w;
+    logic [15:0] P_out_w;
 
     // SPI slave
     spi_slave u_spi (

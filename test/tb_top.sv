@@ -1,39 +1,24 @@
 // =============================================================================
 // tb_top.sv — SPI master BFM testbench for tt_um_joram200
-// INT16 Q8.8 fixed-point, 2D state (x ∈ ℝ², P ∈ ℝ²ˣ²).
+// INT16 Q8.8 fixed-point, 1D (scalar) state.
 //
-// Module hierarchy:
-//   spi_master_bfm   — SPI master with named tasks
-//   result_checker   — INT16 ULP comparator (4-ULP threshold)
-//   program_block    — One Kalman measurement-update scenario
-//   tb_top           — Top-level testbench
-//
-// SPI protocol: CPOL=0, CPHA=0, MSB-first, 8-bit frames.
-// Command byte: [7]=R/W (1=write, 0=read), [6:0]=register index.
-// Data: 8 bytes per register, MSB-first.
-// INT16 Q8.8 value occupies lower 16 bits: host sends 6 zero bytes then 2 INT16 bytes.
-// burst_buf[i] = {48'h0, int16_value} for all data registers.
-//
-// Register map (17 registers):
+// Register map (8 registers):
 //   0   CTRL       W    [0]=start, [1]=sw_rst
 //   1   STAT       R    [0]=done,  [1]=busy
 //   2   z          W    measurement Q8.8
-//   3-4  x_in[0:1] W   prior state (2D)
-//   5-6  x_out[0:1] R  corrected state (2D)
-//   7-10 P_in[0:3] W   prior covariance (2×2 row-major)
-//  11-14 P_out[0:3] R  updated covariance (2×2 row-major)
-//  15   R_REG      R/W  measurement noise R (default 5.0 Q8.8 = 0x0500)
+//   3   x_in       W    prior scalar state
+//   4   x_out      R    corrected scalar state
+//   5   P_in       W    prior scalar covariance
+//   6   P_out      R    updated scalar covariance
+//   7   R_REG      R/W  measurement noise R (default 5.0 Q8.8 = 0x0500)
 //
-// iverilog 12 compatibility notes:
-//   - No unpacked array subroutine ports
-//   - Burst data passed via module-level burst_buf array
-//   - No variable declarations inside initial blocks
+// Scenario: z=1.5, x_in=0, P_in=1.0, R=5.0
+//   Expected: x_out=0x003F (63/256≈0.246), P_out=0x00D6 (214/256≈0.836)
 // =============================================================================
 `timescale 1ns/1ps
 
 // -----------------------------------------------------------------------------
 // spi_master_bfm — SPI master bus functional model
-// burst_buf[] holds 64-bit SPI words; INT16 Q8.8 data is in lower 16 bits.
 // -----------------------------------------------------------------------------
 module spi_master_bfm #(
     parameter real SPI_CLK_NS = 80.0
@@ -163,44 +148,27 @@ endmodule
 
 
 // -----------------------------------------------------------------------------
-// result_checker — compare INT16 Q8.8 hardware outputs against golden reference
-// INT16 values zero-extended to 64 bits: burst_buf = {48'h0, int16_value}.
-// Distance = absolute difference on 64-bit word (== LSB distance for Q8.8).
+// result_checker — compare INT16 Q8.8 scalar outputs against golden reference
 //
-// Scenario: z=1.5, x_in=[0,0], P_in=I2, R=5.0  (all Q8.8)
-//   S_Q88=0x0600, S_inv=42(=0x002A), K[0]=42, K[1]=0
-//   ky[0]=63, ky[1]=0
-//   x_out=[0x003F, 0x0000]
-//   P_out=[0x00D6, 0x0000, 0x0000, 0x0100]
+// Scenario: z=1.5, x=0, P=1.0, R=5.0  (Q8.8)
+//   x_out = 0x003F (63/256 ≈ 0.246)
+//   P_out = 0x00D6 (214/256 ≈ 0.836)
 // -----------------------------------------------------------------------------
 module result_checker #(
     parameter int ULP_THRESHOLD = 4
 )();
-    // Golden reference — INT16 Q8.8 values, zero-extended to 64 bits
-    logic [63:0] REF_XOUT [0:1];
-    logic [63:0] REF_POUT [0:3];
+    logic [63:0] REF_XOUT;
+    logic [63:0] REF_POUT;
+    logic [63:0] hw_x;
+    logic [63:0] hw_p;
 
-    logic [63:0] hw_x [0:1];
-    logic [63:0] hw_p [0:3];
-
-    integer _i;
     initial begin
-        // x_out[0] = 63/256 ≈ 0.246 (K[0]*y = 42*384>>8 = 63 = 0x003F)
-        REF_XOUT[0] = 64'h000000000000003F;
-        REF_XOUT[1] = 64'h0000000000000000;
-
-        // P_out[0,0] = 214/256 ≈ 0.836 (1.0 - K[0]*P[0,0] = 256-42 = 214 = 0x00D6)
-        REF_POUT[0] = 64'h00000000000000D6;
-        REF_POUT[1] = 64'h0000000000000000;
-        REF_POUT[2] = 64'h0000000000000000;
-        // P_out[1,1] = 1.0 = 0x0100 (K[1]=0, no change)
-        REF_POUT[3] = 64'h0000000000000100;
-
-        for (_i = 0; _i < 2; _i = _i + 1) hw_x[_i] = 64'h0;
-        for (_i = 0; _i < 4; _i = _i + 1) hw_p[_i] = 64'h0;
+        REF_XOUT = 64'h000000000000003F;
+        REF_POUT = 64'h00000000000000D6;
+        hw_x = 64'h0;
+        hw_p = 64'h0;
     end
 
-    // ULP distance (signed-integer reinterpret on 64-bit word)
     function automatic longint unsigned ulp_dist (
         input logic [63:0] a, b
     );
@@ -213,26 +181,24 @@ module result_checker #(
     task automatic check ();
         int pass;
         longint unsigned d;
-        integer i;
         pass = 1;
-        for (i = 0; i < 2; i = i + 1) begin
-            d = ulp_dist(hw_x[i], REF_XOUT[i]);
-            if (d > ULP_THRESHOLD) begin
-                $error("x_out[%0d]: hw=%016h ref=%016h ULP=%0d FAIL", i, hw_x[i], REF_XOUT[i], d);
-                pass = 0;
-            end else begin
-                $display("x_out[%0d]: ULP=%0d PASS", i, d);
-            end
+
+        d = ulp_dist(hw_x, REF_XOUT);
+        if (d > ULP_THRESHOLD) begin
+            $error("x_out: hw=%016h ref=%016h ULP=%0d FAIL", hw_x, REF_XOUT, d);
+            pass = 0;
+        end else begin
+            $display("x_out: ULP=%0d PASS", d);
         end
-        for (i = 0; i < 4; i = i + 1) begin
-            d = ulp_dist(hw_p[i], REF_POUT[i]);
-            if (d > ULP_THRESHOLD) begin
-                $error("P_out[%0d]: hw=%016h ref=%016h ULP=%0d FAIL", i, hw_p[i], REF_POUT[i], d);
-                pass = 0;
-            end else begin
-                $display("P_out[%0d]: ULP=%0d PASS", i, d);
-            end
+
+        d = ulp_dist(hw_p, REF_POUT);
+        if (d > ULP_THRESHOLD) begin
+            $error("P_out: hw=%016h ref=%016h ULP=%0d FAIL", hw_p, REF_POUT, d);
+            pass = 0;
+        end else begin
+            $display("P_out: ULP=%0d PASS", d);
         end
+
         if (pass)
             $display("RESULT_CHECKER: ALL OUTPUTS WITHIN %0d ULP — PASS", ULP_THRESHOLD);
         else
@@ -243,32 +209,21 @@ endmodule
 
 
 // -----------------------------------------------------------------------------
-// program_block — INT16 Q8.8 test scenario data (2D state)
-// Scenario: z=1.5, x_in=[0,0], P_in=I2, R=5.0
-// All values stored as {48'h0, Q8.8_value} in 64-bit burst_buf entries.
-// Q8.8: real_value * 256.  z=1.5→0x0180, 1.0→0x0100, 5.0→0x0500.
+// program_block — INT16 Q8.8 test scenario data (1D scalar)
+// Scenario: z=1.5, x_in=0, P_in=1.0, R=5.0
 // -----------------------------------------------------------------------------
 module program_block (
     input  logic clk
 );
     logic [63:0] Z_VAL;
-    logic [63:0] X_IN [0:1];
-    logic [63:0] P_IN [0:3];
+    logic [63:0] X_IN;
+    logic [63:0] P_IN;
 
-    integer _i;
     initial begin
-        // z = 1.5 in Q8.8 = 384 = 0x0180
-        Z_VAL  = 64'h0000000000000180;
-
-        X_IN[0] = 64'h0000000000000000;
-        X_IN[1] = 64'h0000000000000000;
-
-        // Identity matrix (2×2 row-major), Q8.8 1.0 = 0x0100
-        for (_i = 0; _i < 4; _i = _i + 1) P_IN[_i] = 64'h0;
-        P_IN[0] = 64'h0000000000000100; // 1.0 [0,0]
-        P_IN[3] = 64'h0000000000000100; // 1.0 [1,1]
+        Z_VAL = 64'h0000000000000180;  // 1.5 Q8.8
+        X_IN  = 64'h0000000000000000;  // 0.0 Q8.8
+        P_IN  = 64'h0000000000000100;  // 1.0 Q8.8
     end
-    // R_REG default (5.0 Q8.8 = 0x0500) loaded at reset — no explicit write needed
 endmodule
 
 
@@ -279,7 +234,7 @@ module tb_top;
 
     logic clk, rst_n;
     initial clk = 1'b0;
-    always #10 clk = ~clk;  // 50 MHz (20 ns period)
+    always #10 clk = ~clk;  // 50 MHz
 
     logic [7:0] ui_in, uo_out, uio_in, uio_out, uio_oe;
     logic       ena;
@@ -322,25 +277,20 @@ module tb_top;
     end
 
     initial begin
-        integer i;
-
         rst_n = 1'b0;
         repeat(20) @(posedge clk);
         rst_n = 1'b1;
         repeat(10) @(posedge clk);
 
-        $display("=== SPI Kalman update test (INT16 Q8.8, 2D state) ===");
+        $display("=== SPI Kalman update test (INT16 Q8.8, 1D scalar) ===");
 
-        // Write z (reg 2) and x_in[0:1] (regs 3-4) in one burst of 3
+        // Write z (reg 2), x_in (reg 3) in one burst of 2
         u_bfm.burst_buf[0] = u_prog.Z_VAL;
-        u_bfm.burst_buf[1] = u_prog.X_IN[0];
-        u_bfm.burst_buf[2] = u_prog.X_IN[1];
-        u_bfm.spi_write_burst(7'd2, 3);
+        u_bfm.burst_buf[1] = u_prog.X_IN;
+        u_bfm.spi_write_burst(7'd2, 2);
 
-        // Write P_in[0:3] (regs 7-10) in one burst of 4
-        for (i = 0; i < 4; i = i + 1)
-            u_bfm.burst_buf[i] = u_prog.P_IN[i];
-        u_bfm.spi_write_burst(7'd7, 4);
+        // Write P_in (reg 5) individually
+        u_bfm.spi_write(7'd5, u_prog.P_IN);
 
         // Fire: write CTRL.start = 1
         u_bfm.spi_write(7'd0, 64'h0000000000000001);
@@ -350,15 +300,11 @@ module tb_top;
         u_bfm.poll_done(500000);
         $display("Done asserted.");
 
-        // Read x_out[0:1] (regs 5-6)
-        u_bfm.spi_read_burst(7'd5, 2);
-        for (i = 0; i < 2; i = i + 1)
-            u_checker.hw_x[i] = u_bfm.burst_buf[i];
+        // Read x_out (reg 4)
+        u_bfm.spi_read(7'd4, u_checker.hw_x);
 
-        // Read P_out[0:3] (regs 11-14)
-        u_bfm.spi_read_burst(7'd11, 4);
-        for (i = 0; i < 4; i = i + 1)
-            u_checker.hw_p[i] = u_bfm.burst_buf[i];
+        // Read P_out (reg 6)
+        u_bfm.spi_read(7'd6, u_checker.hw_p);
 
         // ULP comparison against golden reference
         u_checker.check();

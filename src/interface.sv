@@ -1,31 +1,22 @@
 `timescale 1ns/1ps
 // =============================================================================
 // interface.sv — SPI slave register file for tt_um_joram200
-// INT16 Q8.8 fixed-point version, 2D state (x ∈ ℝ², P ∈ ℝ²ˣ²).
+// INT16 Q8.8 fixed-point version, 1D (scalar) state.
 //
 // Protocol: CPOL=0, CPHA=0, MSB-first, 8-bit frames.
 // Transaction: 1 command byte + 8 data bytes (64-bit SPI word).
 // Command byte: bit[7]=R/W (1=write, 0=read), bits[6:0]=register address.
 // INT16 value occupies the LOWER 16 bits of each 64-bit SPI word.
-// Host sends: [63:16]=zeros, [15:0]=Q8.8 value (MSB-first byte order).
 //
-// Register map (17 registers, indices 0–16):
-//   0   CTRL      W      [0]=start one-shot, [1]=sw_rst (level)
-//   1   STAT      R      [0]=done_latch (clears on read), [1]=busy
-//   2   z         W      scalar measurement Q8.8
-//   3   x_in[0]   W      prior state element 0 Q8.8
-//   4   x_in[1]   W      prior state element 1 Q8.8
-//   5   x_out[0]  R      corrected state element 0 Q8.8
-//   6   x_out[1]  R      corrected state element 1 Q8.8
-//   7   P_in[0]   W      prior covariance [0,0] Q8.8
-//   8   P_in[1]   W      prior covariance [0,1] Q8.8
-//   9   P_in[2]   W      prior covariance [1,0] Q8.8
-//  10   P_in[3]   W      prior covariance [1,1] Q8.8
-//  11   P_out[0]  R      updated covariance [0,0] Q8.8
-//  12   P_out[1]  R      updated covariance [0,1] Q8.8
-//  13   P_out[2]  R      updated covariance [1,0] Q8.8
-//  14   P_out[3]  R      updated covariance [1,1] Q8.8
-//  15   R_REG     R/W   measurement noise R; reset default = 5.0 (0x0500)
+// Register map (8 registers, indices 0–7):
+//   0   CTRL      W    [0]=start one-shot, [1]=sw_rst (level)
+//   1   STAT      R    [0]=done_latch (clears on read), [1]=busy
+//   2   z         W    scalar measurement Q8.8
+//   3   x_in      W    prior scalar state Q8.8
+//   4   x_out     R    corrected scalar state Q8.8
+//   5   P_in      W    prior scalar covariance Q8.8
+//   6   P_out     R    updated scalar covariance Q8.8
+//   7   R_REG     R/W  measurement noise R; reset default = 5.0 (0x0500)
 // =============================================================================
 module spi_slave (
     input  logic        clk,
@@ -37,13 +28,13 @@ module spi_slave (
     output logic        core_start,
     output logic        sw_rst,
     output logic [15:0] z_reg,
-    output logic [31:0] x_in_reg,    // 2×16
-    output logic [63:0] P_in_reg,    // 4×16
+    output logic [15:0] x_in_reg,
+    output logic [15:0] P_in_reg,
     output logic [15:0] r_val,
     input  logic        done,
     input  logic        busy,
-    input  logic [31:0] x_out,       // 2×16
-    input  logic [63:0] P_out        // 4×16
+    input  logic [15:0] x_out,
+    input  logic [15:0] P_out
 );
 
     // -------------------------------------------------------------------------
@@ -92,38 +83,22 @@ module spi_slave (
 
     localparam logic [15:0] R_DEFAULT = 16'h0500; // 5.0 in Q8.8
 
-    // Unpack x_out and P_out for read function
-    logic [15:0] x_out_arr [0:1];
-    logic [15:0] P_out_arr [0:3];
-
-    assign x_out_arr[0] = x_out[15:0];
-    assign x_out_arr[1] = x_out[31:16];
-
-    assign P_out_arr[0] = P_out[15:0];
-    assign P_out_arr[1] = P_out[31:16];
-    assign P_out_arr[2] = P_out[47:32];
-    assign P_out_arr[3] = P_out[63:48];
-
     // Stored prior state/covariance (written by host before start)
-    logic [15:0] x_in_arr [0:1];
-    logic [15:0] P_in_arr [0:3];
+    logic [15:0] x_in_r;
+    logic [15:0] P_in_r;
 
-    assign x_in_reg = {x_in_arr[1], x_in_arr[0]};
-    assign P_in_reg = {P_in_arr[3], P_in_arr[2], P_in_arr[1], P_in_arr[0]};
+    assign x_in_reg = x_in_r;
+    assign P_in_reg = P_in_r;
 
     // -------------------------------------------------------------------------
     // Register read: returns {48'h0, int16_value} in 64-bit SPI word
     // -------------------------------------------------------------------------
     function automatic logic [63:0] reg_read_fn (input logic [6:0] addr);
         case (addr)
-            7'd1:  reg_read_fn = {62'b0, busy, done_latch};
-            7'd5:  reg_read_fn = {48'h0, x_out_arr[0]};
-            7'd6:  reg_read_fn = {48'h0, x_out_arr[1]};
-            7'd11: reg_read_fn = {48'h0, P_out_arr[0]};
-            7'd12: reg_read_fn = {48'h0, P_out_arr[1]};
-            7'd13: reg_read_fn = {48'h0, P_out_arr[2]};
-            7'd14: reg_read_fn = {48'h0, P_out_arr[3]};
-            7'd15: reg_read_fn = {48'h0, r_val};
+            7'd1: reg_read_fn = {62'b0, busy, done_latch};
+            7'd4: reg_read_fn = {48'h0, x_out};
+            7'd6: reg_read_fn = {48'h0, P_out};
+            7'd7: reg_read_fn = {48'h0, r_val};
             default: reg_read_fn = 64'h0;
         endcase
     endfunction
@@ -140,7 +115,6 @@ module spi_slave (
     wire [47:0] rx_acc_lo   = rx_acc[47:0];
 
     // INT16 extraction: lower 16 bits of 64-bit SPI word = bytes 6 and 7
-    // byte 6 = rx_acc[7:0], byte 7 = {rx_byte[6:0], mosi_r}
     wire [7:0] rx_acc_b6 = rx_acc[7:0];
 
     // -------------------------------------------------------------------------
@@ -161,10 +135,9 @@ module spi_slave (
             core_start <= 1'b0;
             sw_rst     <= 1'b0;
             z_reg      <= 16'h0;
-            x_in_arr[0] <= 16'h0; x_in_arr[1] <= 16'h0;
-            P_in_arr[0] <= 16'h0; P_in_arr[1] <= 16'h0;
-            P_in_arr[2] <= 16'h0; P_in_arr[3] <= 16'h0;
-            r_val       <= R_DEFAULT;
+            x_in_r     <= 16'h0;
+            P_in_r     <= 16'h0;
+            r_val      <= R_DEFAULT;
         end else begin
             core_start <= 1'b0;
 
@@ -207,8 +180,6 @@ module spi_slave (
                         if (bit_cnt == 3'd7) begin
                             bit_cnt <= 3'd0;
                             if (byte_cnt == 3'd7) begin
-                                // 64-bit word complete
-                                // INT16 = lower 16 bits = bytes 6 and 7
                                 byte_cnt <= 3'd0;
                                 rx_acc   <= 56'h0;
                                 rx_byte  <= 8'h0;
@@ -218,14 +189,10 @@ module spi_slave (
                                             core_start <= mosi_r;
                                             sw_rst     <= rx_byte_b0;
                                         end
-                                        7'd2:  z_reg        <= {rx_acc_b6, rx_byte_lo, mosi_r};
-                                        7'd3:  x_in_arr[0]  <= {rx_acc_b6, rx_byte_lo, mosi_r};
-                                        7'd4:  x_in_arr[1]  <= {rx_acc_b6, rx_byte_lo, mosi_r};
-                                        7'd7:  P_in_arr[0]  <= {rx_acc_b6, rx_byte_lo, mosi_r};
-                                        7'd8:  P_in_arr[1]  <= {rx_acc_b6, rx_byte_lo, mosi_r};
-                                        7'd9:  P_in_arr[2]  <= {rx_acc_b6, rx_byte_lo, mosi_r};
-                                        7'd10: P_in_arr[3]  <= {rx_acc_b6, rx_byte_lo, mosi_r};
-                                        7'd15: r_val        <= {rx_acc_b6, rx_byte_lo, mosi_r};
+                                        7'd2: z_reg  <= {rx_acc_b6, rx_byte_lo, mosi_r};
+                                        7'd3: x_in_r <= {rx_acc_b6, rx_byte_lo, mosi_r};
+                                        7'd5: P_in_r <= {rx_acc_b6, rx_byte_lo, mosi_r};
+                                        7'd7: r_val  <= {rx_acc_b6, rx_byte_lo, mosi_r};
                                         default: ;
                                     endcase
                                 end
