@@ -35,7 +35,7 @@ module int12_mul_seq (
     input  logic        start,
     input  logic [11:0] a,
     input  logic [11:0] b,
-    output logic [11:0] result,
+    output wire  [11:0] result,
     output logic        done
 );
     logic [23:0] accum;
@@ -43,6 +43,10 @@ module int12_mul_seq (
     logic [23:0] b_ext;
     logic [3:0]  bit_cnt;
     logic        busy;
+
+    // result is combinational: valid while accum holds the finished product
+    // (accum is not cleared until the next start pulse)
+    assign result = accum[19:8];
 
     logic [23:0] new_accum;
     always_comb begin
@@ -56,7 +60,7 @@ module int12_mul_seq (
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            busy    <= 1'b0; done    <= 1'b0; result  <= 12'h0;
+            busy    <= 1'b0; done    <= 1'b0;
             accum   <= 24'h0; bit_cnt <= 4'd0;
             a_r     <= 12'h0; b_ext   <= 24'h0;
         end else begin
@@ -74,7 +78,6 @@ module int12_mul_seq (
                     a_r     <= {1'b0, a_r[11:1]};
                     bit_cnt <= bit_cnt + 4'd1;
                 end else begin
-                    result  <= accum[19:8];
                     done    <= 1'b1;
                     busy    <= 1'b0;
                     bit_cnt <= 4'd0;
