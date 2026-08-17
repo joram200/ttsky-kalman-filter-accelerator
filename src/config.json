@@ -23,9 +23,6 @@
   "PL_RESIZER_HOLD_SLACK_MARGIN": 0.0,
   "GRT_RESIZER_HOLD_SLACK_MARGIN": 0.0,
 
-  "//": "Aggressive area synthesis — reduces cell count without changing RTL behaviour.",
-  "SYNTH_STRATEGY": "AREA 3",
-
   "//": "RUN_LINTER, LINTER_INCLUDE_PDK_MODELS - Disabling the linter is not recommended!",
   "RUN_LINTER": 1,
   "LINTER_INCLUDE_PDK_MODELS": 1,
