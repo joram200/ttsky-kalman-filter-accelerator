@@ -97,11 +97,10 @@ module int12_div (
     input  logic        rst_n,
     input  logic        start,
     input  logic [11:0] S_Q48,
-    output logic [11:0] inv_Q48,
+    output wire  [11:0] inv_Q48,
     output logic        done
 );
     logic [16:0] partial_rem;
-    logic [11:0] divisor_r;
     logic [15:0] quotient;
     logic [4:0]  bit_cnt;
     logic        busy;
@@ -110,19 +109,24 @@ module int12_div (
     logic [16:0] shifted_rem;
     logic [16:0] trial;
 
+    wire [11:0] div_s = (S_Q48 == 12'h0) ? 12'h001 : S_Q48;
+
     assign dbit        = (bit_cnt == 5'd0) ? 1'b1 : 1'b0;
     assign shifted_rem = {partial_rem[15:0], dbit};
-    assign trial       = shifted_rem - {5'b0, divisor_r};
+    assign trial       = shifted_rem - {5'b0, div_s};
+
+    // inv_Q48 is combinational — valid whenever quotient holds the finished result
+    assign inv_Q48 = (S_Q48 == 12'h0) ? 12'hFFF :
+                     (|quotient[15:12])  ? 12'hFFF : quotient[11:0];
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            busy <= 1'b0; done <= 1'b0; inv_Q48 <= 12'h0;
-            partial_rem <= 17'h0; divisor_r <= 12'h0;
+            busy <= 1'b0; done <= 1'b0;
+            partial_rem <= 17'h0;
             quotient <= 16'h0; bit_cnt <= 5'd0;
         end else begin
             done <= 1'b0;
             if (start && !busy) begin
-                divisor_r   <= (S_Q48 == 12'h0) ? 12'h001 : S_Q48;
                 partial_rem <= 17'h0;
                 quotient    <= 16'h0;
                 bit_cnt     <= 5'd0;
@@ -157,8 +161,6 @@ module int12_div (
                     end
                     bit_cnt <= bit_cnt + 5'd1;
                 end else begin
-                    inv_Q48 <= (S_Q48 == 12'h0) ? 12'hFFF :
-                               (|quotient[15:12])  ? 12'hFFF : quotient[11:0];
                     done    <= 1'b1;
                     busy    <= 1'b0;
                     bit_cnt <= 5'd0;
@@ -204,11 +206,11 @@ module kalman_update (
     // -------------------------------------------------------------------------
     // Intermediate registers
     // -------------------------------------------------------------------------
-    logic [11:0] y_tilde;
-    logic [11:0] S_reg;
-    logic [11:0] S_inv;
     logic [11:0] K_reg;
-    logic [11:0] ky_tmp;
+
+    // Combinational intermediates — stable because par_reg holds inputs steady
+    wire [11:0] y_tilde_comb = z - x_in;
+    wire [11:0] S_comb       = P_in + r_val;
 
     // -------------------------------------------------------------------------
     // Shared multiplier + divider
@@ -225,7 +227,7 @@ module kalman_update (
     );
     int12_div u_div (
         .clk(clk), .rst_n(rst_n), .start(div_start_w),
-        .S_Q48(S_reg), .inv_Q48(div_result), .done(div_done_w)
+        .S_Q48(S_comb), .inv_Q48(div_result), .done(div_done_w)
     );
 
     // mul_start_w — fires when not active and state needs a multiply
@@ -248,9 +250,9 @@ module kalman_update (
     always_comb begin
         mul_a = 12'h0; mul_b = 12'h0;
         case (state)
-            K_COMP:   begin mul_a = P_in;  mul_b = S_inv;   end  // K = P*S_inv
-            KY_COMP:  begin mul_a = K_reg; mul_b = y_tilde; end  // ky = K*y
-            P_UPDATE: begin mul_a = K_reg; mul_b = P_in;    end  // kp = K*P
+            K_COMP:   begin mul_a = P_in;  mul_b = div_result;   end  // K = P*S_inv
+            KY_COMP:  begin mul_a = K_reg; mul_b = y_tilde_comb; end  // ky = K*y
+            P_UPDATE: begin mul_a = K_reg; mul_b = P_in;         end  // kp = K*P
             default: ;
         endcase
     end
@@ -276,8 +278,7 @@ module kalman_update (
         if (!rst_n) begin
             state      <= IDLE;
             mul_active <= 1'b0; div_active <= 1'b0;
-            y_tilde    <= 12'h0; S_reg   <= 12'h0; S_inv  <= 12'h0;
-            K_reg      <= 12'h0; ky_tmp  <= 12'h0;
+            K_reg      <= 12'h0;
             x_out      <= 12'h0; P_out   <= 12'h0;
         end else begin
             state <= state_nxt;
@@ -289,14 +290,9 @@ module kalman_update (
             else if (div_done_w) div_active <= 1'b0;
 
             case (state)
-                S_COMP: begin
-                    y_tilde <= z - x_in;
-                    S_reg   <= P_in + r_val;
-                end
-                DIV:      if (div_done_w) S_inv  <= div_result;
+                S_COMP:   ;  // no datapath; transitions to DIV next cycle
                 K_COMP:   if (mul_done_w) K_reg  <= mul_result;
-                KY_COMP:  if (mul_done_w) ky_tmp <= mul_result;
-                X_ADD:    x_out <= x_in + ky_tmp;
+                X_ADD:    x_out <= x_in + mul_result;
                 P_UPDATE: if (mul_done_w) P_out  <= P_in - mul_result;
                 default: ;
             endcase
