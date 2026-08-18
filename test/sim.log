@@ -1,0 +1,9 @@
+FST info: dumpfile tb_top.fst opened for output.
+=== Parallel GPIO Kalman update test (INT10 Q4.6, 1D scalar) ===
+Waiting for done...
+Done asserted.
+x_out: ULP=0 PASS
+P_out: ULP=0 PASS
+RESULT_CHECKER: ALL OUTPUTS WITHIN 4 ULP — PASS
+=== Test complete ===
+tb_top.sv:270: $finish called at 2291000 (1ps)
